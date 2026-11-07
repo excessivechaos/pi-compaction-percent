@@ -47,3 +47,14 @@ eq(m.loadConfig(path), C({ percent: 55, statusLine: true }), "round-trip");
 eq(m.loadConfig(join(dir, "nope.json")).percent, 40, "unreadable -> defaults");
 
 console.log(`${checks} checks passed`);
+
+// resolveWindow: the report of the window must survive router/* virtual models (ctx.model window 0)
+{
+  const { resolveWindow } = m;
+  const router = { model: { contextWindow: 0 } };
+  eq(resolveWindow(router, { contextWindow: 500_000 }), 500_000, "usage wins over a 0 virtual window");
+  eq(resolveWindow(router, undefined), undefined, "no usage, virtual window 0 -> undefined");
+  eq(resolveWindow({ model: { contextWindow: 1_000_000 } }, undefined), 1_000_000, "falls back to ctx.model");
+  eq(resolveWindow({}, { contextWindow: 0 }), undefined, "0 window is never a threshold");
+  console.log(`${checks} checks passed (with resolveWindow)`);
+}

@@ -109,6 +109,18 @@ export function decide(input: {
 	return { compact: true, tokens, threshold, window: contextWindow as number };
 }
 
+/**
+ * The window the rule applies to. `ctx.getContextUsage()` reports it for the model actually serving
+ * the session — including `router/*` virtual models, whose own `ctx.model.contextWindow` is 0.
+ */
+export function resolveWindow(
+	ctx: { model?: { contextWindow?: number } },
+	usage: { contextWindow?: number } | undefined,
+): number | undefined {
+	const window = usage?.contextWindow ?? ctx.model?.contextWindow;
+	return typeof window === "number" && window > 0 ? window : undefined;
+}
+
 const STATUS_KEY = "compaction-percent";
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
@@ -134,12 +146,13 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	const evaluate = async (ctx: ExtensionContext, when: string) => {
 		if (inFlight) return;
 		const usage = ctx.getContextUsage();
-		const window = ctx.model?.contextWindow;
-		current = usage?.tokens === undefined || window === undefined ? undefined : { tokens: usage.tokens, window };
+		const window = resolveWindow(ctx, usage);
+		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
+		current = tokens === undefined || window === undefined ? undefined : { tokens, window };
 		paintStatus(ctx);
 		const decision = decide({
 			config,
-			tokens: usage?.tokens,
+			tokens,
 			contextWindow: window,
 			now: Date.now(),
 			lastCompactionAt,
@@ -176,9 +189,9 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 
 	const statusText = (ctx: ExtensionContext) => {
 		const usage = ctx.getContextUsage();
-		const window = ctx.model?.contextWindow;
+		const window = resolveWindow(ctx, usage);
 		const threshold = thresholdTokens(config.percent, window);
-		const tokens = usage?.tokens;
+		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
 		const lines = [
 			`compaction-percent ${config.enabled ? "on" : "off"} · ${config.percent}%${config.dryRun ? " · dry-run" : ""}`,
 			`model ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"} · window ${window === undefined ? "—" : window.toLocaleString()}`,
@@ -243,8 +256,9 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	// Between turns: keep the status line honest, never compact (the run is still live).
 	pi.on("turn_end", (_event, ctx) => {
 		const usage = ctx.getContextUsage();
-		const window = ctx.model?.contextWindow;
-		current = usage?.tokens === undefined || window === undefined ? undefined : { tokens: usage.tokens, window };
+		const window = resolveWindow(ctx, usage);
+		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
+		current = tokens === undefined || window === undefined ? undefined : { tokens, window };
 		paintStatus(ctx);
 	});
 	pi.on("before_agent_start", (_event, ctx) => {
