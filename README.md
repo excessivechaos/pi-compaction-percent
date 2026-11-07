@@ -70,6 +70,14 @@ so the setting lives in a command and in a JSON file:
 `~/.pi/agent/compaction-percent.json` is the same setting, so a bootstrap script can write it
 instead.
 
+## The window a `router/*` model reports
+
+The rule reads the window from `ctx.getContextUsage().contextWindow`, not from `ctx.model`, because
+a virtual model (pi's subscription router and anything else that resolves a model per request)
+reports `contextWindow: 0` on `ctx.model` while the usage report carries the window of the model
+that actually served the last turn. `ctx.model` is only the fallback. With a 40% rule the footer
+then reads `📉 40% · 213k/500k (43%)` even though `ctx.model` is `router/orchestrator`.
+
 ## When it compacts
 
 Only from the idle point (`agent_settled`). `ctx.compact()` aborts the active run first, so
