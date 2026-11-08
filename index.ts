@@ -18,7 +18,7 @@
  *
  * Commands: /compaction-percent [status|on|off|<percent>]  (alias /compact-pct)
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -35,34 +35,14 @@ export interface CompactionPercentConfig {
 	statusLine: boolean;
 	/** Decide and log, never compact. */
 	dryRun: boolean;
-	/**
-	 * Which window the percentage applies to. `floor` (default) uses the smallest window among the
-	 * models this session can be routed to, so a fallback to a smaller rung never has to compact
-	 * after the fact; `served` uses the window of the model that answered last.
-	 */
-	windowStrategy: "floor" | "served";
 }
 
 export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	enabled: true,
 	percent: 40,
-	statusLine: true,
+	statusLine: false,
 	dryRun: false,
-	windowStrategy: "floor",
 };
-
-/** Parse `provider/modelId`, splitting at the first slash — ids may contain more. */
-export function splitModelKey(key: string): { provider: string; id: string } | undefined {
-	const i = key.indexOf("/");
-	if (i <= 0 || i === key.length - 1) return undefined;
-	return { provider: key.slice(0, i), id: key.slice(i + 1) };
-}
-
-/** The smallest declared window in a set, or undefined when none is known. */
-export function floorWindow(windows: readonly (number | undefined)[]): number | undefined {
-	const known = windows.filter((w): w is number => typeof w === "number" && w > 0);
-	return known.length === 0 ? undefined : Math.min(...known);
-}
 
 /** pi's refusals that mean "nothing to do", not "something broke". */
 const BENIGN = /Nothing to compact|Already compacted/i;
@@ -87,7 +67,6 @@ export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 			percent: clampPercent(raw.percent) ?? DEFAULT_CONFIG.percent,
 			statusLine: typeof raw.statusLine === "boolean" ? raw.statusLine : DEFAULT_CONFIG.statusLine,
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
-			windowStrategy: raw.windowStrategy === "served" || raw.windowStrategy === "floor" ? raw.windowStrategy : DEFAULT_CONFIG.windowStrategy,
 		};
 	} catch {
 		return { ...DEFAULT_CONFIG };
@@ -130,74 +109,16 @@ export function decide(input: {
 	return { compact: true, tokens, threshold, window: contextWindow as number };
 }
 
-/** Router profile chains from `subscription-router.json`, cached by file mtime. */
-export const ROUTER_CONFIG_PATH = join(AGENT_DIR, "subscription-router.json");
-
-export function readRouterProfiles(path = ROUTER_CONFIG_PATH): Record<string, string[]> {
-	if (!existsSync(path)) return {};
-	try {
-		const raw = JSON.parse(readFileSync(path, "utf-8")) as { profiles?: Record<string, { chain?: unknown }> };
-		const out: Record<string, string[]> = {};
-		for (const [name, profile] of Object.entries(raw.profiles ?? {})) {
-			const chain = profile?.chain;
-			if (!Array.isArray(chain)) continue;
-			out[name] = chain
-				.map((rung) => (typeof rung === "string" ? rung : typeof rung?.model === "string" ? rung.model : undefined))
-				.filter((rung): rung is string => typeof rung === "string");
-		}
-		return out;
-	} catch {
-		return {};
-	}
-}
-
 /**
- * The window the rule applies to.
- *
- * `served` uses the window of the model that answered last — the only window pi reports, and for a
- * `router/*` selection it is the physical rung that actually served the turn, not the router's
- * intent. Its flaw is timing: a fallback from a 1M model to a 500k model is only visible *after*
- * that rung has answered, so the compaction it justifies happens a turn later and the turn itself
- * pays a cache miss on the switch.
- *
- * `floor` uses the smallest window among every model this session can be routed to, read from the
- * router profile's chain. The threshold is then low enough that no rung can be over budget when a
- * turn starts, so a fallback never triggers a post-switch compaction.
- *
- * Resolution order: the router chain of the session's virtual model, then the served window as a
- * candidate (never larger than the floor's guarantee), then the served window alone.
+ * The window the rule applies to. `ctx.getContextUsage()` reports it for the model actually serving
+ * the session — including `router/*` virtual models, whose own `ctx.model.contextWindow` is 0.
  */
-export interface WindowResolution {
-	window: number | undefined;
-	/** Which rule produced it. */
-	source: "floor" | "served" | "none";
-	/** Every model considered, for the status command. */
-	rungs: { key: string; window: number | undefined }[];
-}
-
-export function resolveWindow(input: {
-	strategy: "floor" | "served";
-	usage?: { contextWindow?: number };
-	model?: { provider?: string; id?: string; contextWindow?: number };
-	profiles: Record<string, string[]>;
-	lookup?: (provider: string, id: string) => { contextWindow?: number } | undefined;
-}): WindowResolution {
-	const { strategy, usage, model, profiles, lookup } = input;
-	const served = usage?.contextWindow ?? (typeof model?.contextWindow === "number" ? model.contextWindow : undefined);
-	const servedKnown = typeof served === "number" && served > 0 ? served : undefined;
-	if (strategy === "served") {
-		return { window: servedKnown, source: servedKnown === undefined ? "none" : "served", rungs: [] };
-	}
-	const profile = model?.provider === "router" && typeof model.id === "string" ? profiles[model.id] : undefined;
-	const rungs = (profile ?? []).flatMap((key) => {
-		const parts = splitModelKey(key);
-		const found = parts && lookup ? lookup(parts.provider, parts.id) : undefined;
-		const window = typeof found?.contextWindow === "number" && found.contextWindow > 0 ? found.contextWindow : undefined;
-		return [{ key, window }];
-	});
-	const window = floorWindow([...rungs.map((rung) => rung.window), servedKnown]);
-	if (window === undefined) return { window: undefined, source: "none", rungs };
-	return { window, source: "floor", rungs };
+export function resolveWindow(
+	ctx: { model?: { contextWindow?: number } },
+	usage: { contextWindow?: number } | undefined,
+): number | undefined {
+	const window = usage?.contextWindow ?? ctx.model?.contextWindow;
+	return typeof window === "number" && window > 0 ? window : undefined;
 }
 
 const STATUS_KEY = "compaction-percent";
@@ -212,29 +133,6 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	let current: { tokens: number; window: number } | undefined;
 
 	/** Footer segment, so the rule is visible without opening a command. */
-	/** Router profiles, re-read only when the file changes. */
-	let profilesCache: { mtime: number; profiles: Record<string, string[]> } | undefined;
-	const profiles = (): Record<string, string[]> => {
-		try {
-			const mtime = statSync(ROUTER_CONFIG_PATH).mtimeMs;
-			if (profilesCache?.mtime === mtime) return profilesCache.profiles;
-			const read = readRouterProfiles();
-			profilesCache = { mtime, profiles: read };
-			return read;
-		} catch {
-			return profilesCache?.profiles ?? {};
-		}
-	};
-
-	const windowFor = (ctx: ExtensionContext, usage: { contextWindow?: number } | undefined) =>
-		resolveWindow({
-			strategy: config.windowStrategy,
-			usage,
-			model: ctx.model,
-			profiles: profiles(),
-			lookup: (provider, id) => ctx.modelRegistry?.find(provider, id),
-		});
-
 	const paintStatus = (ctx: ExtensionContext) => {
 		if (!config.enabled || !config.statusLine || current === undefined) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
@@ -248,7 +146,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	const evaluate = async (ctx: ExtensionContext, when: string) => {
 		if (inFlight) return;
 		const usage = ctx.getContextUsage();
-		const { window } = windowFor(ctx, usage);
+		const window = resolveWindow(ctx, usage);
 		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
 		current = tokens === undefined || window === undefined ? undefined : { tokens, window };
 		paintStatus(ctx);
@@ -291,17 +189,12 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 
 	const statusText = (ctx: ExtensionContext) => {
 		const usage = ctx.getContextUsage();
-		const resolved = windowFor(ctx, usage);
-		const window = resolved.window;
+		const window = resolveWindow(ctx, usage);
 		const threshold = thresholdTokens(config.percent, window);
 		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
-		const rungLine = resolved.rungs.length === 0
-			? undefined
-			: `candidates ${resolved.rungs.map((rung) => `${rung.key.split("/").slice(1).join("/")} ${rung.window === undefined ? "?" : fmt(rung.window)}`).join(", ")}`;
 		const lines = [
-			`compaction-percent ${config.enabled ? "on" : "off"} · ${config.percent}% · ${config.windowStrategy} window${config.dryRun ? " · dry-run" : ""}`,
-			`model ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"} · window ${window === undefined ? "—" : window.toLocaleString()}${resolved.source === "floor" ? " (floor)" : ""}`,
-			...(rungLine ? [rungLine] : []),
+			`compaction-percent ${config.enabled ? "on" : "off"} · ${config.percent}%${config.dryRun ? " · dry-run" : ""}`,
+			`model ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"} · window ${window === undefined ? "—" : window.toLocaleString()}`,
 			`context ${tokens === undefined ? "—" : tokens.toLocaleString()}${threshold === undefined ? "" : ` · compacts at ${threshold.toLocaleString()}`}`,
 			`status line ${config.statusLine ? "on" : "off"}${skipBelowTokens === undefined ? "" : ` · retry above ${skipBelowTokens.toLocaleString()}`} · config ${CONFIG_PATH}`,
 		];
@@ -327,13 +220,6 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			ctx.ui.notify(`compaction-percent dry-run ${config.dryRun ? "on" : "off"}`, "info");
 			return;
 		}
-		if (arg === "floor" || arg === "served") {
-			config = { ...config, windowStrategy: arg };
-			saveConfig(config);
-			paintStatus(ctx);
-			ctx.ui.notify(`compaction window: ${arg}`, "info");
-			return;
-		}
 		if (arg === "line") {
 			config = { ...config, statusLine: !config.statusLine };
 			saveConfig(config);
@@ -343,7 +229,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		}
 		const percent = clampPercent(arg);
 		if (percent === undefined) {
-			ctx.ui.notify("usage: /compaction-percent [status|on|off|floor|served|dry-run|line|<5-95>]", "error");
+			ctx.ui.notify("usage: /compaction-percent [status|on|off|dry-run|line|<5-95>]", "error");
 			return;
 		}
 		config = { ...config, percent };
@@ -353,7 +239,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	};
 
 	pi.registerCommand("compaction-percent", {
-		description: "Compact at a percentage of the window: /compaction-percent [status|on|off|floor|served|line|dry-run|5-95]",
+		description: "Compact at a percentage of the model's window: /compaction-percent [status|on|off|line|5-95]",
 		handler: command,
 	});
 	pi.registerCommand("compact-pct", {
@@ -370,7 +256,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	// Between turns: keep the status line honest, never compact (the run is still live).
 	pi.on("turn_end", (_event, ctx) => {
 		const usage = ctx.getContextUsage();
-		const { window } = windowFor(ctx, usage);
+		const window = resolveWindow(ctx, usage);
 		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
 		current = tokens === undefined || window === undefined ? undefined : { tokens, window };
 		paintStatus(ctx);

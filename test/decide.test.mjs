@@ -48,54 +48,13 @@ eq(m.loadConfig(join(dir, "nope.json")).percent, 40, "unreadable -> defaults");
 
 console.log(`${checks} checks passed`);
 
-// resolveWindow: served vs floor, and router/* virtual models (ctx.model window 0)
+// resolveWindow: the report of the window must survive router/* virtual models (ctx.model window 0)
 {
   const { resolveWindow } = m;
-  const registry = {
-    "anthropic/claude-opus-5-5": 1_000_000,
-    "openai-codex/gpt-6.1-sol": 500_000,
-    "commandcode/deepseek/deepseek-v4.1-flash": 1_000_000,
-  };
-  const lookup = (p, id) => {
-    const w = registry[`${p}/${id}`];
-    return w === undefined ? undefined : { contextWindow: w };
-  };
-  const profiles = { orchestrator: ["anthropic/claude-opus-5-5", "openai-codex/gpt-6.1-sol", "commandcode/deepseek/deepseek-v4.1-flash"] };
-  const router = { provider: "router", id: "orchestrator", contextWindow: 0 };
-
-  // served: the window pi reports for the rung that answered
-  let r = resolveWindow({ strategy: "served", usage: { contextWindow: 1_000_000 }, model: router, profiles, lookup });
-  eq([r.window, r.source], [1_000_000, "served"], "served uses the answering model");
-
-  // floor: smallest window in the chain, so a fallback to sol is always affordable
-  r = resolveWindow({ strategy: "floor", usage: { contextWindow: 1_000_000 }, model: router, profiles, lookup });
-  eq([r.window, r.source], [500_000, "floor"], "floor picks the smallest rung");
-  eq(r.rungs.map((x) => x.window), [1_000_000, 500_000, 1_000_000], "candidates are the chain");
-
-  // the floor does not depend on which rung answered — that is the point
-  const underSol = resolveWindow({ strategy: "floor", usage: { contextWindow: 500_000 }, model: router, profiles, lookup });
-  eq(underSol.window, 500_000, "floor is stable when the rung changes");
-
-  // an unresolvable rung is skipped rather than poisoning the floor
-  r = resolveWindow({ strategy: "floor", usage: { contextWindow: 1_000_000 }, model: router,
-    profiles: { orchestrator: ["anthropic/claude-opus-5-5", "nope/gone"] }, lookup });
-  eq(r.window, 1_000_000, "unknown rung ignored");
-
-  // plain (non-router) model: nothing to route to, the declared window is the answer
-  r = resolveWindow({ strategy: "floor", usage: undefined, model: { provider: "anthropic", id: "claude-opus-5-5", contextWindow: 1_000_000 }, profiles, lookup });
-  eq([r.window, r.source], [1_000_000, "floor"], "explicit model is its own floor");
-
-  // no chain, no served window: no rule
-  r = resolveWindow({ strategy: "floor", usage: undefined, model: router, profiles: {}, lookup });
-  eq(r.window, undefined, "nothing known -> no threshold");
+  const router = { model: { contextWindow: 0 } };
+  eq(resolveWindow(router, { contextWindow: 500_000 }), 500_000, "usage wins over a 0 virtual window");
+  eq(resolveWindow(router, undefined), undefined, "no usage, virtual window 0 -> undefined");
+  eq(resolveWindow({ model: { contextWindow: 1_000_000 } }, undefined), 1_000_000, "falls back to ctx.model");
+  eq(resolveWindow({}, { contextWindow: 0 }), undefined, "0 window is never a threshold");
+  console.log(`${checks} checks passed (with resolveWindow)`);
 }
-
-// helpers
-{
-  const { splitModelKey, floorWindow } = m;
-  eq(splitModelKey("commandcode/deepseek/deepseek-v4.1-flash"), { provider: "commandcode", id: "deepseek/deepseek-v4.1-flash" }, "splits at the first slash");
-  eq(splitModelKey("nope"), undefined, "no slash -> undefined");
-  eq(floorWindow([1_000_000, 500_000, undefined]), 500_000, "floor ignores unknowns");
-  eq(floorWindow([undefined, 0]), undefined, "zero is not a window");
-}
-console.log(`${checks} checks passed (window resolution)`);
