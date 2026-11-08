@@ -42,7 +42,8 @@ only, not in its overflow path, so a request that blows past the window still co
   "enabled": true,
   "percent": 40,
   "statusLine": true,
-  "dryRun": false
+  "dryRun": false,
+  "windowStrategy": "floor"
 }
 ```
 
@@ -52,6 +53,7 @@ only, not in its overflow path, so a request that blows past the window still co
 | `percent` | `40` | Compact once context exceeds this percentage of the window. Clamped to 5–95. |
 | `statusLine` | `true` | Show `📉 40% · 213k/500k (43%)` in the footer. |
 | `dryRun` | `false` | Log the decision, never compact. |
+| `windowStrategy` | `floor` | `floor` = smallest window this session can be routed to; `served` = window of the model that answered last. See below. |
 
 ## Commands
 
@@ -63,12 +65,49 @@ so the setting lives in a command and in a JSON file:
 /compaction-percent 40         set the percentage (persists immediately)
 /compaction-percent on|off     enable or disable the extension's trigger
 /compaction-percent line       toggle the footer segment
+/compaction-percent floor      window = smallest rung of the router profile (default)
+/compaction-percent served     window = the model that answered last
 /compaction-percent dry-run    toggle deciding without compacting
 /compact-pct 40                alias for the same command
 ```
 
 `~/.pi/agent/compaction-percent.json` is the same setting, so a bootstrap script can write it
 instead.
+
+## Compact before a fallback, not after it
+
+Compacting at the moment a *smaller* model takes over would be ideal: one cache miss for the
+switch, none for a compaction. pi makes that impossible for an extension. `ctx.compact()` starts
+with `await this.abort()`, and pi records the consequence in its own source:
+
+```js
+// agent-session.js, _handleAgentEvent
+// An abort requested while the run was starting, e.g. during before_agent_start, stops it here.
+if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
+```
+
+So a pre-send compaction in `before_agent_start` cancels the prompt it was meant to protect, and one
+between turns cancels the tool loop. There is no hook that runs before a provider request and can
+still compact.
+
+`windowStrategy: "floor"` sidesteps the timing problem instead of fighting it. The threshold is
+`percent` of the **smallest window among the models this session can be routed to**, read from the
+router profile's chain:
+
+```
+orchestrator: opus 1M · sol 500k · deepseek 1M
+floor window: 500k  →  40% = 200,000 tokens
+```
+
+Context is therefore already under every rung's budget when a turn begins, so a fallback to a smaller
+rung cannot need a compaction afterwards — the switch costs its one unavoidable cache miss and
+nothing more. The price: on a 1M window you stop using the 200k–400k range even while the 1M rung is
+serving. `windowStrategy: "served"` restores the full window and accepts a compaction after each
+fallback.
+
+Mid-turn growth is the one case neither rule can preempt: the request that crosses the line goes to
+whatever rung the router picks, and the compaction follows. pi's overflow recovery still covers a
+request that exceeds the window outright.
 
 ## The window a `router/*` model reports
 
