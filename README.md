@@ -88,7 +88,7 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 ```json
 { "enabled": true, "percent": 40, "forcedPercent": 60, "marginPercent": 5,
   "compactionModels": ["commandcode/reflection/beam:free", "current"],
-  "statusLine": true, "dryRun": false }
+  "dryRun": false }
 ```
 
 | key | default | meaning |
@@ -97,7 +97,6 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 | `forcedPercent` | 60 | hard line, mid tool loop; never below `percent` |
 | `marginPercent` | 5 | soft line is lowered by this on a switch (0–20) |
 | `compactionModels` | `["current"]` | summarisers tried in order; `"current"` = the model already serving; `[]` = pi native |
-| `statusLine` | true | footer `📉 40/60% · 213k/500k (43%)` |
 | `dryRun` | false | decide and log, never write |
 
 ## Commands
@@ -108,7 +107,7 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 /compact-pct forced 60        hard line
 /compact-pct margin 5         switch margin
 /compact-pct model beam:free,current   ordered list ("none" = pi native)
-/compact-pct on|off|line|dry-run
+/compact-pct on|off|dry-run
 ```
 
 `/compaction-percent` is the same command. Set `PI_COMPACTION_PERCENT_LOG=/path` to record every

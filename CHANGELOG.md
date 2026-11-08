@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.2.0
+
+- Removed the footer segment and the `statusLine` key: pi's own footer already shows the context
+  window, and a second number next to it was noise. `/compact-pct status` still reports the next
+  model, the window, both lines and the summarisers.
+
 ## 2.1.0
 
 - `compactionModels`: an ordered list of summarisers instead of one hard-coded model. Tried until one

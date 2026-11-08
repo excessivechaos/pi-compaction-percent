@@ -69,8 +69,6 @@ export interface CompactionPercentConfig {
 	 * `"current"` for the model this session is already using. Empty: pi summarises itself.
 	 */
 	compactionModels: string[];
-	/** Show `📉 40/60% · 213k/500k (43%)` in the footer. */
-	statusLine: boolean;
 	/** Decide and log, never compact. */
 	dryRun: boolean;
 }
@@ -81,7 +79,6 @@ export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	forcedPercent: 60,
 	marginPercent: 5,
 	compactionModels: ["current"],
-	statusLine: true,
 	dryRun: false,
 };
 
@@ -137,7 +134,6 @@ export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 			forcedPercent: clampPercent(raw.forcedPercent) ?? DEFAULT_CONFIG.forcedPercent,
 			marginPercent: clampPercent(raw.marginPercent, 0, 20) ?? DEFAULT_CONFIG.marginPercent,
 			compactionModels: readModels(raw),
-			statusLine: typeof raw.statusLine === "boolean" ? raw.statusLine : DEFAULT_CONFIG.statusLine,
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
 		});
 	} catch {
@@ -331,7 +327,6 @@ const log = (message: string) => {
 	} catch {}
 };
 
-const STATUS_KEY = "compaction-percent";
 const FAILURE_BACKOFF_MS = 60_000;
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
@@ -345,7 +340,6 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	let warnedNoNext = false;
 	let warnedNoModel = false;
 	let warnedFailure = false;
-	let current: { tokens: number; window: number } | undefined;
 
 	/** Window and switch state for the next request. */
 	const resolve = (ctx: ExtensionContext) => {
@@ -371,18 +365,6 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			);
 		}
 		return { tokens, window, switching, next };
-	};
-
-	const paint = (ctx: ExtensionContext) => {
-		if (!config.enabled || !config.statusLine || current === undefined) {
-			ctx.ui.setStatus(STATUS_KEY, undefined);
-			return;
-		}
-		const pct = current.window > 0 ? (current.tokens / current.window) * 100 : 0;
-		ctx.ui.setStatus(
-			STATUS_KEY,
-			`📉 ${config.percent}/${config.forcedPercent}% · ${fmt(current.tokens)}/${fmt(current.window)} (${pct.toFixed(0)}%)`,
-		);
 	};
 
 	/** The summarisers to try, in order, resolved against the registry. `"current"` is the next model. */
@@ -496,8 +478,6 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		ctx: ExtensionContext,
 	) => {
 		const r = resolve(ctx);
-		current = r.tokens === undefined || r.window === undefined ? undefined : { tokens: r.tokens, window: r.window };
-		paint(ctx);
 		if (judge !== undefined && r.tokens !== undefined && r.window !== undefined) {
 			const floor = floorAfter(judge, r.tokens, r.window);
 			if (floor !== undefined) {
@@ -554,18 +534,15 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", (event, ctx) => atBoundary("settle", event as never, ctx) as never);
 	// Hard boundary: between the turns of a tool loop.
 	pi.on("turn_end", (event, ctx) => atBoundary("turn", event as never, ctx) as never);
-	pi.on("before_agent_start", (_event, ctx) => paint(ctx));
 	pi.on("session_start", (_event, ctx) => {
 		config = loadConfig();
 		keepRecentCache = undefined;
 		warnedNoNext = warnedNoModel = warnedFailure = false;
 		skipBelow = backoffUntil = undefined;
-		paint(ctx);
 	});
 	pi.on("session_compact", () => {
 		skipBelow = undefined;
 		judge = undefined;
-		current = undefined;
 	});
 
 	// Pi-initiated compactions (/compact, threshold, overflow) get the same summariser.
@@ -606,7 +583,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			`compaction-percent ${config.enabled ? "on" : "off"} · soft ${config.percent}% · hard ${config.forcedPercent}% · switch margin ${config.marginPercent}%${config.dryRun ? " · dry-run" : ""}`,
 			`next model ${r.next ? `${r.next.model} (${r.next.source})` : ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"}${r.switching ? " · SWITCHING" : ""} · window ${r.window === undefined ? "—" : r.window.toLocaleString()}`,
 			`context ${r.tokens === undefined ? "—" : r.tokens.toLocaleString()}${l ? ` · soft line ${l.soft.toLocaleString()} · hard line ${l.hard.toLocaleString()}` : ""}`,
-			`summaries by ${config.compactionModels.join(" -> ") || "(pi native)"} · status line ${config.statusLine ? "on" : "off"} · ${CONFIG_PATH}`,
+			`summaries by ${config.compactionModels.join(" -> ") || "(pi native)"} · ${CONFIG_PATH}`,
 		].join("\n");
 	};
 
@@ -616,13 +593,11 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		const save = (next: CompactionPercentConfig, message: string) => {
 			config = normalize(next);
 			saveConfig(config);
-			paint(ctx);
 			ctx.ui.notify(message, "info");
 		};
 		if (verb === "" || verb === "status") return ctx.ui.notify(statusText(ctx), "info");
 		if (verb === "on" || verb === "off") return save({ ...config, enabled: verb === "on" }, `compaction-percent ${verb}`);
 		if (verb === "dry-run") return save({ ...config, dryRun: !config.dryRun }, `dry-run ${!config.dryRun ? "on" : "off"}`);
-		if (verb === "line") return save({ ...config, statusLine: !config.statusLine }, `status line ${!config.statusLine ? "on" : "off"}`);
 		if (verb === "model" || verb === "models") {
 			if (!value) return ctx.ui.notify(statusText(ctx), "info");
 			if (value.trim() === "none" || value.trim() === "pi") return save({ ...config, compactionModels: [] }, "summaries: pi native only");
@@ -638,7 +613,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			return p === undefined ? ctx.ui.notify("margin: 0 to 20", "error") : save({ ...config, marginPercent: p }, `switch margin ${p}%`);
 		}
 		const p = clampPercent(verb === "soft" ? value : verb);
-		if (p === undefined) return ctx.ui.notify("usage: /compact-pct [status|<5-95>|forced <n>|margin <n>|model <a,b,current|none>|on|off|line|dry-run]", "error");
+		if (p === undefined) return ctx.ui.notify("usage: /compact-pct [status|<5-95>|forced <n>|margin <n>|model <a,b,current|none>|on|off|dry-run]", "error");
 		return save({ ...config, percent: p }, `soft line ${p}%`);
 	};
 	pi.registerCommand("compaction-percent", { description: "Compaction thresholds: /compaction-percent [status|<soft%>|forced <n>|margin <n>|model <key>|on|off|line|dry-run]", handler: command });
