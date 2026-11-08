@@ -1,37 +1,70 @@
 /**
  * pi-compaction-percent
  *
- * pi triggers automatic compaction on a fixed token reserve: `contextTokens > contextWindow −
- * reserveTokens`. That is a token number, so the same value is a different fraction of every
- * model, and keeping one percentage across models means maintaining a per-model table.
+ * pi triggers automatic compaction on a fixed token reserve, so one number means a different
+ * fraction of every model. This extension owns the trigger instead, as percentages of the window of
+ * the model that will serve the NEXT request, and does the work at the boundaries where compacting
+ * is cheapest:
  *
- * This extension owns the trigger instead. Each turn it compares the context this session is
- * actually using with `percent` of the window the serving model declares, and compacts when it
- * crosses. Nothing is computed per model: 40% of 500k and 40% of 1M are the same rule.
+ *   soft   (`percent`, 40)        at run end, and before a switch to another model
+ *   hard   (`forcedPercent`, 60)  at turn end, mid tool loop, so a long task cannot reach the window
  *
- * Run pi with `compaction.enabled: false` so the token trigger stays out of the way. Overflow
- * recovery is unaffected — pi checks `enabled` only in shouldCompact(), not in the overflow path,
- * so a request that blows past the window still compacts and retries.
+ * On a switch to another model the soft line is lowered by `marginPercent` (5): when the context is
+ * already within a few points of the incoming model's line it is cheaper to compact now than to pay
+ * the cold start and then compact a few turns later.
  *
- * Config: `$PI_CODING_AGENT_DIR/compaction-percent.json`
- *   { "enabled": true, "percent": 40, "statusLine": false, "dryRun": false }
+ * Mechanism. Compaction is written as a boundary DRAFT (`agent_before_settle` / `turn_end`
+ * returning `{ entries: [{ type: "compaction", ... }] }`), never `ctx.compact()`, which aborts the
+ * run and would discard the router's pending continuation. The summary is written by
+ * `compactionModel` (default `router/compact`), not by whichever expensive model served the turn.
+ * Pi-initiated compactions (`/compact`, overflow recovery) use the same summariser through
+ * `session_before_compact`; if that model is unavailable pi summarises as it always did.
  *
- * Commands: /compaction-percent [status|on|off|<percent>]  (alias /compact-pct)
+ * The next model comes from the `router:next` entry published by pi-subscription-router. Without
+ * it the window of the current model applies and the rules are identical, minus the switch rule.
+ *
+ * Run pi with `compaction.enabled: false` so pi's token trigger stays out of the way. Overflow
+ * recovery is unaffected: pi consults that flag only in shouldCompact().
+ *
+ * Config: `$PI_CODING_AGENT_DIR/compaction-percent.json`. Commands: /compact-pct, /compaction-percent.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ProjectedSessionEntry, SessionEntry } from "@earendil-works/pi-coding-agent";
+import { compact, estimateTokens, generateSummaryWithUsage } from "@earendil-works/pi-coding-agent";
 
-/** Agent dir, honouring the same override pi itself uses. */
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 export const CONFIG_PATH = join(AGENT_DIR, "compaction-percent.json");
 
+/** Session entry published by pi-subscription-router: the model the next request will use. */
+export const NEXT_ENTRY = "router:next";
+/** Live accessor the router registers on globalThis: `(ctx) => "provider/id" | undefined`. */
+export const PEEK_NEXT = Symbol.for("pi-subscription-router:peek-next");
+
+/** Ask the router for the next model right now; no dependency on handler order. */
+function peekNext(ctx: ExtensionContext): string | undefined {
+	const peek = (globalThis as Record<symbol, unknown>)[PEEK_NEXT];
+	if (typeof peek !== "function") return undefined;
+	try {
+		const key = (peek as (c: ExtensionContext) => unknown)(ctx);
+		return typeof key === "string" ? key : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 export interface CompactionPercentConfig {
 	enabled: boolean;
-	/** Compact once the context exceeds this percentage of the model's window. */
+	/** Soft line: compact at run end / before a switch once context passes this % of the window. */
 	percent: number;
-	/** Show `40% · 213k/500k` in the footer. */
+	/** Hard line: compact between turns of a tool loop once context passes this % of the window. */
+	forcedPercent: number;
+	/** On a switch, the soft line drops by this many points. */
+	marginPercent: number;
+	/** `provider/id` that writes the summaries. Empty or unavailable: pi summarises itself. */
+	compactionModel: string;
+	/** Show `📉 40/60% · 213k/500k (43%)` in the footer. */
 	statusLine: boolean;
 	/** Decide and log, never compact. */
 	dryRun: boolean;
@@ -40,232 +73,486 @@ export interface CompactionPercentConfig {
 export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	enabled: true,
 	percent: 40,
-	statusLine: false,
+	forcedPercent: 60,
+	marginPercent: 5,
+	compactionModel: "router/compact",
+	statusLine: true,
 	dryRun: false,
 };
 
-/** pi's refusals that mean "nothing to do", not "something broke". */
-const BENIGN = /Nothing to compact|Already compacted/i;
-
-/** Shortest interval between compactions, so a turn that does not shrink usage cannot loop. */
-const COOLDOWN_MS = 15_000;
-
-export function clampPercent(value: unknown): number | undefined {
+export function clampPercent(value: unknown, min = 5, max = 95): number | undefined {
 	const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
 	if (typeof n !== "number" || !Number.isFinite(n)) return undefined;
 	const rounded = Math.round(n);
-	if (rounded < 5 || rounded > 95) return undefined;
-	return rounded;
+	return rounded < min || rounded > max ? undefined : rounded;
+}
+
+/** Keep the hard line at or above the soft line, whatever the file says. */
+export function normalize(config: CompactionPercentConfig): CompactionPercentConfig {
+	return config.forcedPercent < config.percent ? { ...config, forcedPercent: config.percent } : config;
 }
 
 export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 	if (!existsSync(path)) return { ...DEFAULT_CONFIG };
 	try {
 		const raw = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
-		return {
+		return normalize({
 			enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_CONFIG.enabled,
 			percent: clampPercent(raw.percent) ?? DEFAULT_CONFIG.percent,
+			forcedPercent: clampPercent(raw.forcedPercent) ?? DEFAULT_CONFIG.forcedPercent,
+			marginPercent: clampPercent(raw.marginPercent, 0, 20) ?? DEFAULT_CONFIG.marginPercent,
+			compactionModel: typeof raw.compactionModel === "string" ? raw.compactionModel.trim() : DEFAULT_CONFIG.compactionModel,
 			statusLine: typeof raw.statusLine === "boolean" ? raw.statusLine : DEFAULT_CONFIG.statusLine,
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
-		};
+		});
 	} catch {
 		return { ...DEFAULT_CONFIG };
 	}
 }
 
 export function saveConfig(config: CompactionPercentConfig, path = CONFIG_PATH): void {
-	const text = `${JSON.stringify(config, null, 2)}\n`;
 	mkdirSync(dirname(path), { recursive: true });
 	const tmp = `${path}.tmp-${process.pid}`;
-	writeFileSync(tmp, text);
+	writeFileSync(tmp, `${JSON.stringify(config, null, 2)}\n`);
 	renameSync(tmp, path);
 }
 
-/** The token count at which this config compacts a window, or undefined when it should not. */
-export function thresholdTokens(percent: number, contextWindow: number | undefined): number | undefined {
-	if (contextWindow === undefined || contextWindow <= 0) return undefined;
-	return Math.floor((contextWindow * percent) / 100);
+/** Parse `provider/modelId`, splitting at the first slash: ids may contain more. */
+export function splitModelKey(key: string): { provider: string; id: string } | undefined {
+	const i = key.indexOf("/");
+	return i <= 0 || i === key.length - 1 ? undefined : { provider: key.slice(0, i), id: key.slice(i + 1) };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decision
+// ---------------------------------------------------------------------------------------------
+
+export type Boundary = "settle" | "turn";
+
+export interface Lines {
+	soft: number;
+	hard: number;
+}
+
+/** Token lines for a window. A switch lowers the soft line by the margin. */
+export function lines(config: CompactionPercentConfig, window: number, switching: boolean): Lines {
+	const soft = Math.max(0, config.percent - (switching ? config.marginPercent : 0));
+	return { soft: Math.floor((window * soft) / 100), hard: Math.floor((window * config.forcedPercent) / 100) };
 }
 
 export type Decision =
-	| { compact: true; tokens: number; threshold: number; window: number }
-	| { compact: false; reason: "disabled" | "no-usage" | "no-window" | "below" | "cooling" };
+	| { compact: true; tier: "soft" | "hard"; tokens: number; line: number; window: number }
+	| { compact: false; reason: string };
 
-/** Pure decision, so the rule can be tested without a session. */
+/**
+ * Pure rule.
+ *   settle: the run is ending, nothing is in flight -> soft line (lowered on a switch).
+ *   turn:   a tool loop continues -> a pending switch uses the lowered soft line, otherwise the
+ *           hard line. A turn with no tool results defers to settle.
+ */
 export function decide(input: {
 	config: CompactionPercentConfig;
+	boundary: Boundary;
 	tokens: number | undefined;
-	contextWindow: number | undefined;
+	window: number | undefined;
+	switching: boolean;
+	/** `turn` only: the turn issued tool calls, so another request follows. */
+	loopContinues?: boolean;
 	now: number;
-	lastCompactionAt: number | undefined;
+	backoffUntil?: number;
+	skipBelow?: number;
 }): Decision {
-	const { config, tokens, contextWindow, now, lastCompactionAt } = input;
+	const { config, boundary, tokens, window, switching, loopContinues, now, backoffUntil, skipBelow } = input;
 	if (!config.enabled) return { compact: false, reason: "disabled" };
 	if (tokens === undefined) return { compact: false, reason: "no-usage" };
-	const threshold = thresholdTokens(config.percent, contextWindow);
-	if (threshold === undefined) return { compact: false, reason: "no-window" };
-	if (tokens < threshold) return { compact: false, reason: "below" };
-	if (lastCompactionAt !== undefined && now - lastCompactionAt < COOLDOWN_MS) return { compact: false, reason: "cooling" };
-	return { compact: true, tokens, threshold, window: contextWindow as number };
+	if (window === undefined || window <= 0) return { compact: false, reason: "no-window" };
+	if (backoffUntil !== undefined && now < backoffUntil) return { compact: false, reason: "backoff" };
+	if (skipBelow !== undefined && tokens < skipBelow) return { compact: false, reason: "nothing-to-compact" };
+	const l = lines(config, window, switching);
+	if (boundary === "settle") {
+		return tokens >= l.soft ? { compact: true, tier: "soft", tokens, line: l.soft, window } : { compact: false, reason: "below" };
+	}
+	if (!loopContinues) return { compact: false, reason: "deferred-to-settle" };
+	if (switching && tokens >= l.soft) return { compact: true, tier: "soft", tokens, line: l.soft, window };
+	if (tokens >= l.hard) return { compact: true, tier: "hard", tokens, line: l.hard, window };
+	return { compact: false, reason: "below" };
 }
 
 /**
- * The window the rule applies to. `ctx.getContextUsage()` reports it for the model actually serving
- * the session — including `router/*` virtual models, whose own `ctx.model.contextWindow` is 0.
+ * After a compaction, judge whether it helped. When the context is still above 80% of what it was,
+ * the kept tail (or the next tool results) refilled it, so compacting again right away would only
+ * pay another summary: hold until it has grown by a tenth of the window.
  */
-export function resolveWindow(
-	ctx: { model?: { contextWindow?: number } },
-	usage: { contextWindow?: number } | undefined,
-): number | undefined {
-	const window = usage?.contextWindow ?? ctx.model?.contextWindow;
-	return typeof window === "number" && window > 0 ? window : undefined;
+export function floorAfter(before: number, after: number, window: number): number | undefined {
+	return after > before * 0.8 ? Math.ceil(after + window * 0.1) : undefined;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Session reading
+// ---------------------------------------------------------------------------------------------
+
+interface Next {
+	model: string;
+	source: string;
+}
+
+/** `provider/id` of the newest assistant response, and the index it sits at. */
+export function lastResponse(entries: readonly SessionEntry[]): { key: string; index: number } | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as unknown as { type?: string; message?: { role?: string; provider?: string; model?: string } };
+		const m = entry.message;
+		if (entry.type === "message" && m?.role === "assistant" && typeof m.provider === "string" && typeof m.model === "string") {
+			return { key: `${m.provider}/${m.model}`, index: i };
+		}
+	}
+	return undefined;
+}
+
+/** The router's published next model, if it was published after the latest response. */
+export function nextModel(entries: readonly SessionEntry[]): Next | undefined {
+	const last = lastResponse(entries);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (last && i < last.index) return undefined; // older than the latest response: stale
+		const entry = entries[i] as unknown as { type?: string; customType?: string; data?: { model?: unknown; source?: unknown } };
+		if (entry.type === "custom" && entry.customType === NEXT_ENTRY && typeof entry.data?.model === "string") {
+			return { model: entry.data.model, source: typeof entry.data.source === "string" ? entry.data.source : "?" };
+		}
+	}
+	return undefined;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cut and summary
+// ---------------------------------------------------------------------------------------------
+
+type AgentMessage = ProjectedSessionEntry["messages"][number];
+
+const CUT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
+
+export interface Cut {
+	/** Index into the projection of the first entry kept. */
+	index: number;
+	firstKeptEntryId: string;
+	/** Messages that the summary replaces. */
+	messages: AgentMessage[];
+	previousSummary?: string;
+}
+
+/**
+ * Choose what to summarise, on the PROJECTION (what the model actually sees), the way pi's own
+ * preparation does: after context edits, after the previous compaction, never between a tool call
+ * and its result, keeping roughly `keepRecentTokens` of the newest messages.
+ */
+export function chooseCut(entries: readonly ProjectedSessionEntry[], keepRecentTokens: number): Cut | undefined {
+	let start = 0;
+	let previousSummary: string | undefined;
+	const prev = entries.findIndex((e) => e.sourceEntry.type === "compaction" && e.messages.length > 0);
+	if (prev >= 0) {
+		previousSummary = (entries[prev].sourceEntry as unknown as { summary?: string }).summary;
+		start = prev + 1;
+	}
+	const end = entries.length;
+	const points: number[] = [];
+	for (let i = start; i < end; i++) {
+		const e = entries[i];
+		if (e.sourceEntry.type !== "compaction" && e.messages.some((m) => CUT_ROLES.has(m.role))) points.push(i);
+	}
+	if (points.length === 0) return undefined;
+	let acc = 0;
+	let cut: number | undefined;
+	for (let i = end - 1; i >= start; i--) {
+		const tokens = entries[i].messages.reduce((sum, m) => sum + estimateTokens(m), 0);
+		if (tokens === 0) continue;
+		acc += tokens;
+		if (acc >= keepRecentTokens) {
+			cut = points.find((p) => p >= i) ?? points[points.length - 1];
+			break;
+		}
+	}
+	if (cut === undefined) return undefined; // everything fits in the kept window: nothing to summarise
+	while (cut > start) {
+		const before = entries[cut - 1];
+		if (before.sourceEntry.type === "compaction" || before.messages.length > 0) break;
+		cut--;
+	}
+	const messages = entries
+		.slice(start, cut)
+		.flatMap((e) => (e.sourceEntry.type === "compaction" ? [] : e.messages.filter((m) => m.role !== "system")));
+	const id = entries[cut]?.sourceEntry.id;
+	if (messages.length === 0 || !id) return undefined;
+	return { index: cut, firstKeptEntryId: id, messages, ...(previousSummary ? { previousSummary } : {}) };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------------------------
+
+/** Set PI_COMPACTION_PERCENT_LOG=/path to record every boundary decision. */
+const LOG_PATH = process.env.PI_COMPACTION_PERCENT_LOG;
+const log = (message: string) => {
+	if (!LOG_PATH) return;
+	try {
+		appendFileSync(LOG_PATH, `${new Date().toISOString()} ${message}\n`);
+	} catch {}
+};
+
 const STATUS_KEY = "compaction-percent";
+const FAILURE_BACKOFF_MS = 60_000;
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
 export default function compactionPercent(pi: ExtensionAPI): void {
 	let config = loadConfig();
-	let lastCompactionAt: number | undefined;
-	/** After a benign no-op, wait until usage grows past this before asking again. */
-	let skipBelowTokens: number | undefined;
 	let inFlight = false;
+	let backoffUntil: number | undefined;
+	let skipBelow: number | undefined;
+	/** Tokens before the last compaction, judged once the next usage figure exists. */
+	let judge: number | undefined;
+	let warnedNoNext = false;
+	let warnedNoModel = false;
+	let warnedFailure = false;
 	let current: { tokens: number; window: number } | undefined;
 
-	/** Footer segment, so the rule is visible without opening a command. */
-	const paintStatus = (ctx: ExtensionContext) => {
+	/** Window and switch state for the next request. */
+	const resolve = (ctx: ExtensionContext) => {
+		const entries = ctx.sessionManager.getEntries() as SessionEntry[];
+		const usage = ctx.getContextUsage();
+		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
+		const live = peekNext(ctx);
+		const next = live !== undefined ? { model: live, source: "live" } : nextModel(entries);
+		let window: number | undefined = usage?.contextWindow && usage.contextWindow > 0 ? usage.contextWindow : undefined;
+		let switching = false;
+		if (next) {
+			const parts = splitModelKey(next.model);
+			const found = parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
+			if (found?.contextWindow && found.contextWindow > 0) window = found.contextWindow;
+			const last = lastResponse(entries);
+			switching = last !== undefined && last.key !== next.model;
+		} else if (ctx.model?.provider === "router" && !warnedNoNext && entries.some((e) => (e as { type?: string }).type === "message")) {
+			warnedNoNext = true;
+			ctx.ui.notify(
+				`compaction-percent: ${ctx.model.id} is a router model but no "${NEXT_ENTRY}" entry was published. ` +
+					"Install git:github.com/excessivechaos/pi-subscription-router; until then the current model's window is used.",
+				"warning",
+			);
+		}
+		return { tokens, window, switching, next };
+	};
+
+	const paint = (ctx: ExtensionContext) => {
 		if (!config.enabled || !config.statusLine || current === undefined) {
 			ctx.ui.setStatus(STATUS_KEY, undefined);
 			return;
 		}
 		const pct = current.window > 0 ? (current.tokens / current.window) * 100 : 0;
-		ctx.ui.setStatus(STATUS_KEY, `📉 ${config.percent}% · ${fmt(current.tokens)}/${fmt(current.window)} (${pct.toFixed(0)}%)`);
+		ctx.ui.setStatus(
+			STATUS_KEY,
+			`📉 ${config.percent}/${config.forcedPercent}% · ${fmt(current.tokens)}/${fmt(current.window)} (${pct.toFixed(0)}%)`,
+		);
 	};
 
-	/** Read usage from the live context and compact when the rule says so. */
-	const evaluate = async (ctx: ExtensionContext, when: string) => {
-		if (inFlight) return;
-		const usage = ctx.getContextUsage();
-		const window = resolveWindow(ctx, usage);
-		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
-		current = tokens === undefined || window === undefined ? undefined : { tokens, window };
-		paintStatus(ctx);
+	const summaryModel = (ctx: ExtensionContext) => {
+		const parts = config.compactionModel ? splitModelKey(config.compactionModel) : undefined;
+		const model = parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
+		if (!model && config.compactionModel && !warnedNoModel) {
+			warnedNoModel = true;
+			ctx.ui.notify(`compaction-percent: compaction model ${config.compactionModel} not found; pi summarises with its own model`, "warning");
+		}
+		return model;
+	};
+
+	/** Build the draft for one boundary, or explain why there is nothing to write. */
+	const draftFor = async (ctx: ExtensionContext, decision: Extract<Decision, { compact: true }>, switching: boolean, nextKey: string | undefined) => {
+		const model = summaryModel(ctx);
+		if (!model) {
+			log(`  no compaction model (${config.compactionModel || "unset"}); nothing written`);
+			return undefined;
+		}
+		const keep = (await readKeepRecent()) ?? 20_000;
+		const cut = chooseCut(ctx.sessionManager.buildSessionProjection().entries, keep);
+		if (!cut) {
+			log("  nothing before the kept tail to summarise");
+			skipBelow = Math.ceil(decision.tokens * 1.2);
+			return undefined;
+		}
+		const started = Date.now();
+		const result = await generateSummaryWithUsage(
+			cut.messages,
+			model,
+			undefined,
+			undefined,
+			undefined,
+			ctx.signal,
+			undefined,
+			cut.previousSummary,
+			"off",
+			ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
+		);
+		if (!result.text.trim()) throw new Error("summary was empty");
+		ctx.ui.notify(
+			`compaction-percent: ${decision.tier} compaction at ${fmt(decision.tokens)} of ${fmt(decision.window)} (${decision.tier === "soft" ? config.percent - (switching ? config.marginPercent : 0) : config.forcedPercent}%)` +
+				`${switching && nextKey ? `, before switching to ${nextKey}` : ""} · summary by ${config.compactionModel} in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+			"info",
+		);
+		return {
+			type: "compaction" as const,
+			summary: result.text,
+			firstKeptEntryId: cut.firstKeptEntryId,
+			usage: result.usage,
+		};
+	};
+
+	/** `keepRecentTokens` from pi's settings, so the kept tail matches what pi would keep. */
+	let keepRecentCache: number | undefined;
+	const readKeepRecent = async (): Promise<number | undefined> => {
+		if (keepRecentCache !== undefined) return keepRecentCache;
+		try {
+			const path = join(AGENT_DIR, "settings.json");
+			const raw = JSON.parse(readFileSync(path, "utf-8")) as { compaction?: { keepRecentTokens?: number } };
+			const v = raw.compaction?.keepRecentTokens;
+			keepRecentCache = typeof v === "number" && v >= 0 ? v : undefined;
+		} catch {}
+		return keepRecentCache;
+	};
+
+	const atBoundary = async (
+		boundary: Boundary,
+		event: { entries: unknown[]; toolResults?: unknown[]; outcome?: string },
+		ctx: ExtensionContext,
+	) => {
+		const r = resolve(ctx);
+		current = r.tokens === undefined || r.window === undefined ? undefined : { tokens: r.tokens, window: r.window };
+		paint(ctx);
+		if (judge !== undefined && r.tokens !== undefined && r.window !== undefined) {
+			const floor = floorAfter(judge, r.tokens, r.window);
+			if (floor !== undefined) {
+				skipBelow = floor;
+				log(`  last compaction did not shrink the context (${judge} -> ${r.tokens}); holding until ${floor}`);
+			}
+			judge = undefined;
+		}
+		if (inFlight) return undefined;
 		const decision = decide({
 			config,
-			tokens,
-			contextWindow: window,
+			boundary,
+			tokens: r.tokens,
+			window: r.window,
+			switching: r.switching,
+			loopContinues: boundary === "turn" ? (event.toolResults?.length ?? 0) > 0 && event.outcome === "completed" : undefined,
 			now: Date.now(),
-			lastCompactionAt,
+			backoffUntil,
+			skipBelow,
 		});
-		if (!decision.compact) return;
-		if (skipBelowTokens !== undefined && decision.tokens < skipBelowTokens) return;
+		log(`${boundary} tokens=${r.tokens} window=${r.window} next=${r.next?.model ?? "-"} switching=${r.switching} -> ${decision.compact ? `${decision.tier} (line ${decision.line})` : decision.reason}`);
+		if (!decision.compact) return undefined;
 		if (config.dryRun) {
-			ctx.ui.notify(`compaction-percent: would compact (${fmt(decision.tokens)} ≥ ${fmt(decision.threshold)} at ${config.percent}%)`, "info");
-			return;
+			ctx.ui.notify(`compaction-percent: would ${decision.tier}-compact at ${fmt(decision.tokens)} (line ${fmt(decision.line)} of ${fmt(decision.window)})`, "info");
+			return undefined;
 		}
 		inFlight = true;
-		lastCompactionAt = Date.now();
-		ctx.ui.notify(`compaction-percent: compacting at ${fmt(decision.tokens)} of ${fmt(decision.window)} (${config.percent}%) · ${when}`, "info");
-		ctx.compact({
-			onComplete: (result) => {
-				inFlight = false;
-				skipBelowTokens = undefined;
-				current = undefined;
-				paintStatus(ctx);
-				ctx.ui.notify(`compaction-percent: compacted, ${fmt(result.tokensBefore)} tokens summarized`, "success");
-			},
-			onError: (error) => {
-				inFlight = false;
-				// pi refuses in two cases that are not failures: there is nothing to summarize yet,
-				// or the newest entry already is a compaction. Back off until usage grows, quietly.
-				if (BENIGN.test(error.message)) {
-					skipBelowTokens = Math.ceil(decision.tokens * 1.2);
-					return;
-				}
-				ctx.ui.notify(`compaction-percent: compaction failed: ${error.message}`, "error");
-			},
-		});
+		try {
+			const draft = await draftFor(ctx, decision, r.switching, r.next?.model);
+			if (!draft) {
+				log("  no draft written");
+				return undefined;
+			}
+			log(`  draft written, firstKept=${draft.firstKeptEntryId} summaryChars=${draft.summary.length}`);
+			skipBelow = undefined;
+			judge = decision.tokens;
+			warnedFailure = false;
+			return { entries: [...(event.entries as never[]), draft] };
+		} catch (error) {
+			log(`  summary failed: ${error instanceof Error ? error.message : String(error)}`);
+			backoffUntil = Date.now() + FAILURE_BACKOFF_MS;
+			if (!warnedFailure) {
+				warnedFailure = true;
+				ctx.ui.notify(`compaction-percent: summary failed (${error instanceof Error ? error.message : String(error)}); retrying in 60s`, "error");
+			}
+			return undefined;
+		} finally {
+			inFlight = false;
+		}
 	};
 
+	// Soft boundary: the run is ending and nothing is in flight; the router's pending continuation, if
+	// any, sees the compacted context because the boundary rebuilds it after every handler.
+	pi.on("agent_before_settle", (event, ctx) => atBoundary("settle", event as never, ctx) as never);
+	// Hard boundary: between the turns of a tool loop.
+	pi.on("turn_end", (event, ctx) => atBoundary("turn", event as never, ctx) as never);
+	pi.on("before_agent_start", (_event, ctx) => paint(ctx));
+	pi.on("session_start", (_event, ctx) => {
+		config = loadConfig();
+		keepRecentCache = undefined;
+		warnedNoNext = warnedNoModel = warnedFailure = false;
+		skipBelow = backoffUntil = undefined;
+		paint(ctx);
+	});
+	pi.on("session_compact", () => {
+		skipBelow = undefined;
+		judge = undefined;
+		current = undefined;
+	});
+
+	// Pi-initiated compactions (/compact, threshold, overflow) get the same summariser.
+	pi.on("session_before_compact", async (event, ctx) => {
+		if (!config.enabled || config.dryRun) return undefined;
+		const model = summaryModel(ctx);
+		if (!model) return undefined;
+		try {
+			const result = await compact(
+				event.preparation,
+				model,
+				undefined,
+				undefined,
+				event.customInstructions,
+				event.signal,
+				"off",
+				ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
+			);
+			return { compaction: result };
+		} catch (error) {
+			ctx.ui.notify(`compaction-percent: ${config.compactionModel} could not summarise (${error instanceof Error ? error.message : String(error)}); pi summarises instead`, "warning");
+			return undefined;
+		}
+	});
+
+	// ---- commands ----------------------------------------------------------------------------
 	const statusText = (ctx: ExtensionContext) => {
-		const usage = ctx.getContextUsage();
-		const window = resolveWindow(ctx, usage);
-		const threshold = thresholdTokens(config.percent, window);
-		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
-		const lines = [
-			`compaction-percent ${config.enabled ? "on" : "off"} · ${config.percent}%${config.dryRun ? " · dry-run" : ""}`,
-			`model ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"} · window ${window === undefined ? "—" : window.toLocaleString()}`,
-			`context ${tokens === undefined ? "—" : tokens.toLocaleString()}${threshold === undefined ? "" : ` · compacts at ${threshold.toLocaleString()}`}`,
-			`status line ${config.statusLine ? "on" : "off"}${skipBelowTokens === undefined ? "" : ` · retry above ${skipBelowTokens.toLocaleString()}`} · config ${CONFIG_PATH}`,
-		];
-		return lines.join("\n");
+		const r = resolve(ctx);
+		const l = r.window === undefined ? undefined : lines(config, r.window, r.switching);
+		return [
+			`compaction-percent ${config.enabled ? "on" : "off"} · soft ${config.percent}% · hard ${config.forcedPercent}% · switch margin ${config.marginPercent}%${config.dryRun ? " · dry-run" : ""}`,
+			`next model ${r.next ? `${r.next.model} (${r.next.source})` : ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"}${r.switching ? " · SWITCHING" : ""} · window ${r.window === undefined ? "—" : r.window.toLocaleString()}`,
+			`context ${r.tokens === undefined ? "—" : r.tokens.toLocaleString()}${l ? ` · soft line ${l.soft.toLocaleString()} · hard line ${l.hard.toLocaleString()}` : ""}`,
+			`summaries by ${config.compactionModel || "(pi's model)"} · status line ${config.statusLine ? "on" : "off"} · ${CONFIG_PATH}`,
+		].join("\n");
 	};
 
 	const command = async (args: string, ctx: ExtensionContext) => {
-		const arg = args.trim();
-		if (arg === "" || arg === "status") {
-			ctx.ui.notify(statusText(ctx), "info");
-			return;
-		}
-		if (arg === "on" || arg === "off") {
-			config = { ...config, enabled: arg === "on" };
+		const [verb = "", ...rest] = args.trim().split(/\s+/);
+		const value = rest.join(" ");
+		const save = (next: CompactionPercentConfig, message: string) => {
+			config = normalize(next);
 			saveConfig(config);
-			paintStatus(ctx);
-			ctx.ui.notify(`compaction-percent ${arg}`, "info");
-			return;
+			paint(ctx);
+			ctx.ui.notify(message, "info");
+		};
+		if (verb === "" || verb === "status") return ctx.ui.notify(statusText(ctx), "info");
+		if (verb === "on" || verb === "off") return save({ ...config, enabled: verb === "on" }, `compaction-percent ${verb}`);
+		if (verb === "dry-run") return save({ ...config, dryRun: !config.dryRun }, `dry-run ${!config.dryRun ? "on" : "off"}`);
+		if (verb === "line") return save({ ...config, statusLine: !config.statusLine }, `status line ${!config.statusLine ? "on" : "off"}`);
+		if (verb === "model") return save({ ...config, compactionModel: value }, `summaries by ${value || "pi's model"}`);
+		if (verb === "forced" || verb === "hard") {
+			const p = clampPercent(value);
+			return p === undefined ? ctx.ui.notify("hard line: a percentage from 5 to 95", "error") : save({ ...config, forcedPercent: p }, `hard line ${p}%`);
 		}
-		if (arg === "dry-run") {
-			config = { ...config, dryRun: !config.dryRun };
-			saveConfig(config);
-			ctx.ui.notify(`compaction-percent dry-run ${config.dryRun ? "on" : "off"}`, "info");
-			return;
+		if (verb === "margin") {
+			const p = clampPercent(value, 0, 20);
+			return p === undefined ? ctx.ui.notify("margin: 0 to 20", "error") : save({ ...config, marginPercent: p }, `switch margin ${p}%`);
 		}
-		if (arg === "line") {
-			config = { ...config, statusLine: !config.statusLine };
-			saveConfig(config);
-			paintStatus(ctx);
-			ctx.ui.notify(`compaction status line ${config.statusLine ? "on" : "off"}`, "info");
-			return;
-		}
-		const percent = clampPercent(arg);
-		if (percent === undefined) {
-			ctx.ui.notify("usage: /compaction-percent [status|on|off|dry-run|line|<5-95>]", "error");
-			return;
-		}
-		config = { ...config, percent };
-		saveConfig(config);
-		paintStatus(ctx);
-		ctx.ui.notify(`compaction now at ${percent}% of the window`, "info");
+		const p = clampPercent(verb === "soft" ? value : verb);
+		if (p === undefined) return ctx.ui.notify("usage: /compact-pct [status|<5-95>|forced <n>|margin <n>|model <provider/id>|on|off|line|dry-run]", "error");
+		return save({ ...config, percent: p }, `soft line ${p}%`);
 	};
-
-	pi.registerCommand("compaction-percent", {
-		description: "Compact at a percentage of the model's window: /compaction-percent [status|on|off|line|5-95]",
-		handler: command,
-	});
-	pi.registerCommand("compact-pct", {
-		description: "Alias for /compaction-percent",
-		handler: command,
-	});
-
-	// Compaction aborts whatever run is in flight, so it is only ever triggered from the idle
-	// point: the next prompt then starts under the threshold. A long tool loop that grows past it
-	// is left to pi's overflow recovery, which still runs.
-	pi.on("agent_settled", async (_event, ctx) => {
-		await evaluate(ctx, "settled");
-	});
-	// Between turns: keep the status line honest, never compact (the run is still live).
-	pi.on("turn_end", (_event, ctx) => {
-		const usage = ctx.getContextUsage();
-		const window = resolveWindow(ctx, usage);
-		const tokens = typeof usage?.tokens === "number" ? usage.tokens : undefined;
-		current = tokens === undefined || window === undefined ? undefined : { tokens, window };
-		paintStatus(ctx);
-	});
-	pi.on("before_agent_start", (_event, ctx) => {
-		paintStatus(ctx);
-	});
-	pi.on("session_start", (_event, ctx) => {
-		config = loadConfig();
-		paintStatus(ctx);
-	});
+	pi.registerCommand("compaction-percent", { description: "Compaction thresholds: /compaction-percent [status|<soft%>|forced <n>|margin <n>|model <key>|on|off|line|dry-run]", handler: command });
+	pi.registerCommand("compact-pct", { description: "Alias for /compaction-percent", handler: command });
 }

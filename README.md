@@ -1,114 +1,127 @@
 # pi-compaction-percent
 
-Compact at a **percentage of the model's context window** instead of a fixed token reserve.
+Compact at a **percentage of the window of the model that will serve the next request**, at the
+points where compacting is cheapest, with summaries written by a cheap model you choose.
 
-pi's automatic compaction triggers on `contextTokens > contextWindow − reserveTokens`. The reserve
-is a token count, so the same number is a different fraction of every model: 40% of a 1M window is
-400k, 40% of a 272k window is 109k, and one `reserveTokens` cannot express both. This extension
-takes over the trigger and compares the session's live context against `percent` of whatever window
-the serving model declares.
+pi's own trigger is a token reserve, so one number is a different fraction of every model, and a
+fallback to a smaller model happens *after* the cold start. This extension owns the trigger and
+works at the boundaries instead.
+
+## The two lines
 
 ```
-compaction-percent 40   →  1M window compacts at 400k, 500k window at 200k, 272k at 109k
+soft  40%   at run end, and before a switch to another model
+hard  60%   between the turns of a tool loop, so a long task cannot reach the window
 ```
+
+On a **switch** (the router is about to use a different model than the one that just answered) the
+soft line drops by `marginPercent` (5): if the context is already within a few points of the incoming
+model's line, compacting now beats paying the cold start and compacting a few turns later. The margin
+applies *only* on a switch.
+
+```
+opus at 300k, router falls back to sol (500k):    line = 35% × 500k = 175k   -> compact first
+opus at 150k, same fallback:                      under the line             -> just switch
+no switch, 500k window:                           line = 40% × 500k = 200k
+```
+
+`percent` and `forcedPercent` are of the *next* model's window, so the same rule works on a 1M, a
+500k and a 256k rung without a per-model table.
+
+## How it compacts
+
+Not with `ctx.compact()`: that aborts the run, which would also discard the router's pending
+continuation. The extension returns a **boundary draft** from `agent_before_settle` / `turn_end`:
+
+```ts
+return { entries: [...event.entries, { type: "compaction", summary, firstKeptEntryId, usage }] }
+```
+
+pi appends it without an abort and rebuilds the context before the next request, so the request
+that follows already carries the compacted context. The cut is computed on pi's *projection* (what the
+model actually sees), never between a tool call and its result, keeping about `keepRecentTokens` of the
+newest messages and carrying a previous summary forward.
+
+Summaries are written by `compactionModel` (default `router/compact`), not by whichever expensive
+model served the turn. `/compact` and overflow recovery use the same model through
+`session_before_compact`. If that model is unavailable the boundary path writes nothing and retries
+after 60 s; the pi-initiated path falls back to pi's own summariser.
 
 ## Install
 
 ```bash
+pi install git:github.com/excessivechaos/pi-subscription-router   # provides the next model
 pi install git:github.com/excessivechaos/pi-compaction-percent
 ```
 
-Then turn pi's token trigger off, or the two rules race each other:
+List the router **before** this package in `settings.json`: a quota fallback is decided at
+`agent_before_settle`, and the extension must see the router's decision.
 
 ```jsonc
-// ~/.pi/agent/settings.json
-{
-  "compaction": {
-    "enabled": false,          // this extension owns the trigger
-    "keepRecentTokens": 20000  // still honoured: how much history survives each compaction
-  }
-}
+{ "compaction": { "enabled": false, "keepRecentTokens": 20000 } }   // pi's token trigger off
 ```
 
-Overflow recovery keeps working with `enabled: false` — pi checks that flag in `shouldCompact()`
-only, not in its overflow path, so a request that blows past the window still compacts and retries.
+Overflow recovery still works with `enabled: false` (pi checks it only in `shouldCompact()`).
+
+To go back to pi's native compaction: `/compact-pct off` and set `compaction.enabled: true`.
+
+Add a profile for the summariser to `subscription-router.json`, e.g. free 1M models first, then a paid
+one as insurance:
+
+```json
+"compact": { "chain": [ { "model": "commandcode/reflection/beam:free" },
+                        { "model": "commandcode/deepseek/deepseek-v4.1-flash" } ] }
+```
+
+Use only models whose window can hold the whole summarised span.
 
 ## Configuration
 
-`$PI_CODING_AGENT_DIR/compaction-percent.json` (default `~/.pi/agent/compaction-percent.json`):
+`$PI_CODING_AGENT_DIR/compaction-percent.json`:
 
 ```json
-{
-  "enabled": true,
-  "percent": 40,
-  "statusLine": true,
-  "dryRun": false
-}
+{ "enabled": true, "percent": 40, "forcedPercent": 60, "marginPercent": 5,
+  "compactionModel": "router/compact", "statusLine": true, "dryRun": false }
 ```
 
-| Key | Default | Meaning |
+| key | default | meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Master switch. Off leaves pi's own trigger as the only compaction. |
-| `percent` | `40` | Compact once context exceeds this percentage of the window. Clamped to 5–95. |
-| `statusLine` | `true` | Show `📉 40% · 213k/500k (43%)` in the footer. |
-| `dryRun` | `false` | Log the decision, never compact. |
+| `percent` | 40 | soft line, % of the next model's window (5–95) |
+| `forcedPercent` | 60 | hard line, mid tool loop; never below `percent` |
+| `marginPercent` | 5 | soft line is lowered by this on a switch (0–20) |
+| `compactionModel` | `router/compact` | `provider/id` that writes summaries; empty = pi's model |
+| `statusLine` | true | footer `📉 40/60% · 213k/500k (43%)` |
+| `dryRun` | false | decide and log, never write |
 
 ## Commands
 
-pi's `/settings` screen is schema-driven from `settings.json`, and extensions cannot add rows to it,
-so the setting lives in a command and in a JSON file:
-
 ```
-/compaction-percent            status: current percent, window, context, threshold, config path
-/compaction-percent 40         set the percentage (persists immediately)
-/compaction-percent on|off     enable or disable the extension's trigger
-/compaction-percent line       toggle the footer segment
-/compaction-percent dry-run    toggle deciding without compacting
-/compact-pct 40                alias for the same command
+/compact-pct                  status: next model, window, soft/hard lines, switching?
+/compact-pct 40               soft line
+/compact-pct forced 60        hard line
+/compact-pct margin 5         switch margin
+/compact-pct model router/compact
+/compact-pct on|off|line|dry-run
 ```
 
-`~/.pi/agent/compaction-percent.json` is the same setting, so a bootstrap script can write it
-instead.
+`/compaction-percent` is the same command. Set `PI_COMPACTION_PERCENT_LOG=/path` to record every
+boundary decision.
 
-## The window a `router/*` model reports
+## Guards
 
-The rule reads the window from `ctx.getContextUsage().contextWindow`, not from `ctx.model`, because
-a virtual model (pi's subscription router and anything else that resolves a model per request)
-reports `contextWindow: 0` on `ctx.model` while the usage report carries the window of the model
-that actually served the last turn. `ctx.model` is only the fallback. With a 40% rule the footer
-then reads `📉 40% · 213k/500k (43%)` even though `ctx.model` is `router/orchestrator`.
+- one compaction at a time; a failed summary backs off 60 s and says so once;
+- a compaction that did not shrink the context (still above 80%) holds the next one until it has grown
+  by 10% of the window;
+- "nothing to compact" holds until usage grows 20%;
+- a router model with no published next model warns once and falls back to the current model's window.
 
-## When it compacts
+## Known limits
 
-Only from the idle point (`agent_settled`). `ctx.compact()` aborts the active run first, so
-triggering it before a prompt would cancel the prompt and triggering it between turns would kill
-the tool loop. At settle there is nothing to abort, and the next prompt starts under the threshold.
-
-The consequence: a single long tool loop that grows past the threshold is not compacted mid-run.
-pi's overflow recovery still covers the case where it grows past the *window*.
-
-pi's two "nothing to do" refusals — `Nothing to compact (session too small)` and
-`Already compacted` — are treated as benign: no error, and no retry until usage grows 20% beyond
-the point that produced them.
-
-## Why not generate `compaction.modelOverrides` instead?
-
-An extension (or the bootstrap script) could enumerate the catalogue and write
-`reserveTokens = (1 − percent) × window` per model, leaving stock compaction untouched. It works,
-right up until a provider adds a model: the new model silently falls back to the global reserve,
-which on a small window means compacting on every turn. The percentage rule cannot go stale,
-because it is evaluated against the model that is actually serving.
-
-## Notes
-
-- `keepRecentTokens` is untouched and still governs how much history survives.
-- Disabling pi's trigger without installing this extension leaves only overflow recovery.
-- Requires pi ≥ 1.5.0 (`ctx.getContextUsage()`, `ctx.compact({ onComplete, onError })`,
-  `agent_settled`).
+- The next model is the router's *prediction* at that moment; a new prompt can re-pick after a quota reset.
+- A quota error retried inside pi's own retry loop has no boundary to act at.
+- File-operation lists that pi's native summary appends are not added to our summaries.
 
 ## Development
-
-`index.ts` is a single file; `decide()` is pure so the rule is testable without a session.
 
 ```bash
 node test/decide.test.mjs

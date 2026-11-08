@@ -1,12 +1,31 @@
 {
 	"name": "pi-compaction-percent",
-	"version": "1.0.0",
-	"description": "Compact at a percentage of the model's context window instead of a fixed token reserve, with /compact-pct to change it",
-	"keywords": ["pi-package", "pi", "compaction", "context", "settings"],
+	"version": "2.0.0",
+	"description": "Compact at a percentage of the next model's window: soft/hard lines, pre-switch compaction, summaries by a cheap model",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"compaction",
+		"context",
+		"settings"
+	],
 	"license": "MIT",
 	"type": "module",
-	"files": ["index.ts", "README.md", "CHANGELOG.md", "LICENSE"],
-	"pi": { "extensions": ["./index.ts"] },
-	"peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-	"engines": { "node": ">=22.19.0" }
+	"files": [
+		"index.ts",
+		"README.md",
+		"CHANGELOG.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
 }
