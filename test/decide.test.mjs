@@ -50,8 +50,19 @@ eq(m.clampPercent(0, 0, 20), 0, "margin 0 allowed"); eq(m.clampPercent(21, 0, 20
 eq(m.normalize(C({ percent: 50, forcedPercent: 40 })).forcedPercent, 50, "hard line never below soft");
 const dir = mkdtempSync(join(tmpdir(), "cpct-")); const path = join(dir, "c.json");
 eq(m.loadConfig(path), C(), "missing file -> defaults");
-m.saveConfig(C({ percent: 35, forcedPercent: 55, marginPercent: 3, compactionModel: "x/y" }), path);
-eq(m.loadConfig(path), C({ percent: 35, forcedPercent: 55, marginPercent: 3, compactionModel: "x/y" }), "round-trip");
+m.saveConfig(C({ percent: 35, forcedPercent: 55, marginPercent: 3, compactionModels: ["x/y", "z/w", "current"] }), path);
+eq(m.loadConfig(path), C({ percent: 35, forcedPercent: 55, marginPercent: 3, compactionModels: ["x/y", "z/w", "current"] }), "round-trip");
+
+// ---- summariser list ---------------------------------------------------------------------------
+eq(m.readModels({}), ["current"], "default list");
+eq(m.readModels({ compactionModels: ["a/b", " a/b ", "c/d", 7, ""] }), ["a/b", "c/d"], "trimmed, deduped, non-strings dropped");
+eq(m.readModels({ compactionModel: "x/y" }), ["x/y"], "2.0 single key still accepted");
+eq(m.readModels({ compactionModels: ["current", "a/b"] }), ["current", "a/b"], "current is kept in config");
+eq(m.summariserKeys(["a/b", "current"], "c/d"), ["a/b", "c/d"], "current expands to the next model");
+eq(m.summariserKeys(["current"], undefined), [], "no current model -> nothing (pi summarises)");
+eq(m.summariserKeys(["a/b", "current"], "a/b"), ["a/b"], "duplicate current collapses");
+eq(m.summariserKeys([], "a/b"), [], "empty list -> pi native");
+eq(m.summariserKeys(["a/b", "a/b"], undefined), ["a/b"], "duplicate entries collapse");
 eq(m.splitModelKey("commandcode/deepseek/deepseek-v4.1-flash"), { provider: "commandcode", id: "deepseek/deepseek-v4.1-flash" }, "first slash");
 eq(m.splitModelKey("nope"), undefined, "no slash");
 

@@ -42,10 +42,12 @@ that follows already carries the compacted context. The cut is computed on pi's 
 model actually sees), never between a tool call and its result, keeping about `keepRecentTokens` of the
 newest messages and carrying a previous summary forward.
 
-Summaries are written by `compactionModel` (default `router/compact`), not by whichever expensive
-model served the turn. `/compact` and overflow recovery use the same model through
-`session_before_compact`. If that model is unavailable the boundary path writes nothing and retries
-after 60 s; the pi-initiated path falls back to pi's own summariser.
+Summaries are written by `compactionModels`, an ordered list tried until one answers — a quota-blocked
+provider or a bad key just moves to the next entry. `"current"` means the model this session is already
+using, and an empty list means pi native. `/compact` and overflow recovery use the same list through
+`session_before_compact`; if every entry fails there, pi summarises as it always did. On the boundary
+path a failed compaction writes nothing and backs off 60 s — pi's overflow recovery still guards the
+window.
 
 ## Install
 
@@ -65,15 +67,19 @@ Overflow recovery still works with `enabled: false` (pi checks it only in `shoul
 
 To go back to pi's native compaction: `/compact-pct off` and set `compaction.enabled: true`.
 
-Add a profile for the summariser to `subscription-router.json`, e.g. free 1M models first, then a paid
-one as insurance:
+Point the list at whatever is cheap today — physical models, a router profile, or `current`:
 
-```json
-"compact": { "chain": [ { "model": "commandcode/reflection/beam:free" },
-                        { "model": "commandcode/deepseek/deepseek-v4.1-flash" } ] }
+```jsonc
+"compactionModels": [
+  "commandcode/reflection/beam:free",            // free 1M model
+  "router/compact",                              // or a router profile, if you prefer chains
+  "commandcode/deepseek/deepseek-v4.1-flash",    // insurance
+  "current"                                      // last resort: the model already serving
+]
 ```
 
-Use only models whose window can hold the whole summarised span.
+Use only models whose window can hold the whole summarised span: the summary prompt carries the
+serialized conversation, so a 256k model cannot summarise a 500k compaction.
 
 ## Configuration
 
@@ -81,7 +87,8 @@ Use only models whose window can hold the whole summarised span.
 
 ```json
 { "enabled": true, "percent": 40, "forcedPercent": 60, "marginPercent": 5,
-  "compactionModel": "router/compact", "statusLine": true, "dryRun": false }
+  "compactionModels": ["commandcode/reflection/beam:free", "current"],
+  "statusLine": true, "dryRun": false }
 ```
 
 | key | default | meaning |
@@ -89,7 +96,7 @@ Use only models whose window can hold the whole summarised span.
 | `percent` | 40 | soft line, % of the next model's window (5–95) |
 | `forcedPercent` | 60 | hard line, mid tool loop; never below `percent` |
 | `marginPercent` | 5 | soft line is lowered by this on a switch (0–20) |
-| `compactionModel` | `router/compact` | `provider/id` that writes summaries; empty = pi's model |
+| `compactionModels` | `["current"]` | summarisers tried in order; `"current"` = the model already serving; `[]` = pi native |
 | `statusLine` | true | footer `📉 40/60% · 213k/500k (43%)` |
 | `dryRun` | false | decide and log, never write |
 
@@ -100,7 +107,7 @@ Use only models whose window can hold the whole summarised span.
 /compact-pct 40               soft line
 /compact-pct forced 60        hard line
 /compact-pct margin 5         switch margin
-/compact-pct model router/compact
+/compact-pct model beam:free,current   ordered list ("none" = pi native)
 /compact-pct on|off|line|dry-run
 ```
 

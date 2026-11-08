@@ -16,7 +16,9 @@
  * Mechanism. Compaction is written as a boundary DRAFT (`agent_before_settle` / `turn_end`
  * returning `{ entries: [{ type: "compaction", ... }] }`), never `ctx.compact()`, which aborts the
  * run and would discard the router's pending continuation. The summary is written by
- * `compactionModel` (default `router/compact`), not by whichever expensive model served the turn.
+ * The first entry of `compactionModels` that answers, not whichever expensive model served the turn.
+ * The list is ordinary config; `"current"` stands for the model the session is already using, so a
+ * list ending in `"current"` always has a working summariser, and an empty list means "pi native".
  * Pi-initiated compactions (`/compact`, overflow recovery) use the same summariser through
  * `session_before_compact`; if that model is unavailable pi summarises as it always did.
  *
@@ -62,8 +64,11 @@ export interface CompactionPercentConfig {
 	forcedPercent: number;
 	/** On a switch, the soft line drops by this many points. */
 	marginPercent: number;
-	/** `provider/id` that writes the summaries. Empty or unavailable: pi summarises itself. */
-	compactionModel: string;
+	/**
+	 * Summarisers, tried in order. Each entry is a `provider/id` (a router virtual model is fine) or
+	 * `"current"` for the model this session is already using. Empty: pi summarises itself.
+	 */
+	compactionModels: string[];
 	/** Show `📉 40/60% · 213k/500k (43%)` in the footer. */
 	statusLine: boolean;
 	/** Decide and log, never compact. */
@@ -75,7 +80,7 @@ export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	percent: 40,
 	forcedPercent: 60,
 	marginPercent: 5,
-	compactionModel: "router/compact",
+	compactionModels: ["current"],
 	statusLine: true,
 	dryRun: false,
 };
@@ -85,6 +90,36 @@ export function clampPercent(value: unknown, min = 5, max = 95): number | undefi
 	if (typeof n !== "number" || !Number.isFinite(n)) return undefined;
 	const rounded = Math.round(n);
 	return rounded < min || rounded > max ? undefined : rounded;
+}
+
+/** Accept `compactionModels: [...]`, and the single `compactionModel` of 2.0 as a one-item list. */
+export function readModels(raw: Record<string, unknown>): string[] {
+	const list = Array.isArray(raw.compactionModels)
+		? raw.compactionModels
+		: typeof raw.compactionModel === "string"
+			? [raw.compactionModel]
+			: undefined;
+	if (list === undefined) return [...DEFAULT_CONFIG.compactionModels];
+	const seen = new Set<string>();
+	return list
+		.filter((entry): entry is string => typeof entry === "string")
+		.map((entry) => entry.trim())
+		.filter((entry) => entry !== "" && !seen.has(entry) && seen.add(entry) !== undefined);
+}
+
+/**
+ * The ordered keys to try, with `"current"` expanded to the model that would serve the next request.
+ * `current` is dropped when it is already listed, and a list that is only `["current"]` with no known
+ * current model yields nothing — the caller then leaves the compaction to pi.
+ */
+export function summariserKeys(models: readonly string[], currentKey: string | undefined): string[] {
+	const out: string[] = [];
+	for (const entry of models) {
+		const key = entry === "current" ? currentKey : entry;
+		if (!key || out.includes(key)) continue;
+		out.push(key);
+	}
+	return out;
 }
 
 /** Keep the hard line at or above the soft line, whatever the file says. */
@@ -101,7 +136,7 @@ export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 			percent: clampPercent(raw.percent) ?? DEFAULT_CONFIG.percent,
 			forcedPercent: clampPercent(raw.forcedPercent) ?? DEFAULT_CONFIG.forcedPercent,
 			marginPercent: clampPercent(raw.marginPercent, 0, 20) ?? DEFAULT_CONFIG.marginPercent,
-			compactionModel: typeof raw.compactionModel === "string" ? raw.compactionModel.trim() : DEFAULT_CONFIG.compactionModel,
+			compactionModels: readModels(raw),
 			statusLine: typeof raw.statusLine === "boolean" ? raw.statusLine : DEFAULT_CONFIG.statusLine,
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
 		});
@@ -350,21 +385,73 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		);
 	};
 
-	const summaryModel = (ctx: ExtensionContext) => {
-		const parts = config.compactionModel ? splitModelKey(config.compactionModel) : undefined;
-		const model = parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
-		if (!model && config.compactionModel && !warnedNoModel) {
-			warnedNoModel = true;
-			ctx.ui.notify(`compaction-percent: compaction model ${config.compactionModel} not found; pi summarises with its own model`, "warning");
+	/** The summarisers to try, in order, resolved against the registry. `"current"` is the next model. */
+	const summaryModels = (ctx: ExtensionContext) => {
+		const r = resolve(ctx);
+		const currentKey = r.next?.model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		const keys = summariserKeys(config.compactionModels, currentKey);
+		const resolved: { key: string; model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>> }[] = [];
+		for (const key of keys) {
+			const parts = splitModelKey(key);
+			const model = parts ? ctx.modelRegistry.find(parts.provider, parts.id) : undefined;
+			if (model) resolved.push({ key, model });
 		}
-		return model;
+		if (resolved.length === 0 && keys.length > 0 && !warnedNoModel) {
+			warnedNoModel = true;
+			ctx.ui.notify(
+				`compaction-percent: none of ${keys.join(", ")} is available; pi summarises with its own model`,
+				"warning",
+			);
+		}
+		return resolved;
+	};
+
+	/**
+	 * Try the configured summarisers in order. The first one that returns a summary wins; a failure
+	 * moves to the next, so a dead provider or an exhausted window does not cost the compaction. When
+	 * every entry fails the boundary writes nothing (pi's overflow recovery still covers the wall) and
+	 * the pi-initiated path falls back to pi's own summariser.
+	 */
+	const summarise = async (
+		ctx: ExtensionContext,
+		messages: Parameters<typeof generateSummaryWithUsage>[0],
+		previousSummary: string | undefined,
+	): Promise<{ key: string; text: string; usage: Awaited<ReturnType<typeof generateSummaryWithUsage>>["usage"] } | undefined> => {
+		const candidates = summaryModels(ctx);
+		if (candidates.length === 0) return undefined;
+		const failures: string[] = [];
+		for (const { key, model } of candidates) {
+			try {
+				const result = await generateSummaryWithUsage(
+					messages,
+					model,
+					undefined,
+					undefined,
+					undefined,
+					ctx.signal,
+					undefined,
+					previousSummary,
+					"off",
+					ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
+				);
+				if (!result.text.trim()) throw new Error("empty summary");
+				if (failures.length > 0) log(`  summariser ${key} worked after: ${failures.join("; ")}`);
+				return { key, text: result.text, usage: result.usage };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				failures.push(`${key}: ${message}`);
+				log(`  summariser ${key} failed: ${message}`);
+			}
+		}
+		log(`  every summariser failed (${failures.join("; ")})`);
+		return undefined;
 	};
 
 	/** Build the draft for one boundary, or explain why there is nothing to write. */
 	const draftFor = async (ctx: ExtensionContext, decision: Extract<Decision, { compact: true }>, switching: boolean, nextKey: string | undefined) => {
-		const model = summaryModel(ctx);
-		if (!model) {
-			log(`  no compaction model (${config.compactionModel || "unset"}); nothing written`);
+		const candidates = summaryModels(ctx);
+		if (candidates.length === 0) {
+			log(`  no summariser available (${config.compactionModels.join(" -> ") || "empty list"}); nothing written`);
 			return undefined;
 		}
 		const keep = (await readKeepRecent()) ?? 20_000;
@@ -375,22 +462,11 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			return undefined;
 		}
 		const started = Date.now();
-		const result = await generateSummaryWithUsage(
-			cut.messages,
-			model,
-			undefined,
-			undefined,
-			undefined,
-			ctx.signal,
-			undefined,
-			cut.previousSummary,
-			"off",
-			ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
-		);
-		if (!result.text.trim()) throw new Error("summary was empty");
+		const result = await summarise(ctx, cut.messages, cut.previousSummary);
+		if (!result) throw new Error(`no summariser answered (${config.compactionModels.join(", ")})`);
 		ctx.ui.notify(
 			`compaction-percent: ${decision.tier} compaction at ${fmt(decision.tokens)} of ${fmt(decision.window)} (${decision.tier === "soft" ? config.percent - (switching ? config.marginPercent : 0) : config.forcedPercent}%)` +
-				`${switching && nextKey ? `, before switching to ${nextKey}` : ""} · summary by ${config.compactionModel} in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+				`${switching && nextKey ? `, before switching to ${nextKey}` : ""} · summary by ${result.key} in ${((Date.now() - started) / 1000).toFixed(1)}s`,
 			"info",
 		);
 		return {
@@ -495,24 +571,31 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	// Pi-initiated compactions (/compact, threshold, overflow) get the same summariser.
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (!config.enabled || config.dryRun) return undefined;
-		const model = summaryModel(ctx);
-		if (!model) return undefined;
-		try {
-			const result = await compact(
-				event.preparation,
-				model,
-				undefined,
-				undefined,
-				event.customInstructions,
-				event.signal,
-				"off",
-				ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
-			);
-			return { compaction: result };
-		} catch (error) {
-			ctx.ui.notify(`compaction-percent: ${config.compactionModel} could not summarise (${error instanceof Error ? error.message : String(error)}); pi summarises instead`, "warning");
-			return undefined;
+		const failures: string[] = [];
+		for (const { key, model } of summaryModels(ctx)) {
+			try {
+				const result = await compact(
+					event.preparation,
+					model,
+					undefined,
+					undefined,
+					event.customInstructions,
+					event.signal,
+					"off",
+					ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
+				);
+				if (failures.length > 0) log(`  pi-initiated summary by ${key} after: ${failures.join("; ")}`);
+				return { compaction: result };
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				failures.push(`${key}: ${message}`);
+				log(`  pi-initiated summariser ${key} failed: ${message}`);
+			}
 		}
+		if (failures.length > 0) {
+			ctx.ui.notify(`compaction-percent: no summariser answered (${failures.join("; ")}); pi summarises instead`, "warning");
+		}
+		return undefined;
 	});
 
 	// ---- commands ----------------------------------------------------------------------------
@@ -523,7 +606,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			`compaction-percent ${config.enabled ? "on" : "off"} · soft ${config.percent}% · hard ${config.forcedPercent}% · switch margin ${config.marginPercent}%${config.dryRun ? " · dry-run" : ""}`,
 			`next model ${r.next ? `${r.next.model} (${r.next.source})` : ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"}${r.switching ? " · SWITCHING" : ""} · window ${r.window === undefined ? "—" : r.window.toLocaleString()}`,
 			`context ${r.tokens === undefined ? "—" : r.tokens.toLocaleString()}${l ? ` · soft line ${l.soft.toLocaleString()} · hard line ${l.hard.toLocaleString()}` : ""}`,
-			`summaries by ${config.compactionModel || "(pi's model)"} · status line ${config.statusLine ? "on" : "off"} · ${CONFIG_PATH}`,
+			`summaries by ${config.compactionModels.join(" -> ") || "(pi native)"} · status line ${config.statusLine ? "on" : "off"} · ${CONFIG_PATH}`,
 		].join("\n");
 	};
 
@@ -540,7 +623,12 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		if (verb === "on" || verb === "off") return save({ ...config, enabled: verb === "on" }, `compaction-percent ${verb}`);
 		if (verb === "dry-run") return save({ ...config, dryRun: !config.dryRun }, `dry-run ${!config.dryRun ? "on" : "off"}`);
 		if (verb === "line") return save({ ...config, statusLine: !config.statusLine }, `status line ${!config.statusLine ? "on" : "off"}`);
-		if (verb === "model") return save({ ...config, compactionModel: value }, `summaries by ${value || "pi's model"}`);
+		if (verb === "model" || verb === "models") {
+			if (!value) return ctx.ui.notify(statusText(ctx), "info");
+			if (value.trim() === "none" || value.trim() === "pi") return save({ ...config, compactionModels: [] }, "summaries: pi native only");
+			const models = readModels({ compactionModels: value.split(",").map((v) => v.trim()).filter(Boolean) });
+			return save({ ...config, compactionModels: models }, `summaries by ${models.join(" -> ")}`);
+		}
 		if (verb === "forced" || verb === "hard") {
 			const p = clampPercent(value);
 			return p === undefined ? ctx.ui.notify("hard line: a percentage from 5 to 95", "error") : save({ ...config, forcedPercent: p }, `hard line ${p}%`);
@@ -550,7 +638,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			return p === undefined ? ctx.ui.notify("margin: 0 to 20", "error") : save({ ...config, marginPercent: p }, `switch margin ${p}%`);
 		}
 		const p = clampPercent(verb === "soft" ? value : verb);
-		if (p === undefined) return ctx.ui.notify("usage: /compact-pct [status|<5-95>|forced <n>|margin <n>|model <provider/id>|on|off|line|dry-run]", "error");
+		if (p === undefined) return ctx.ui.notify("usage: /compact-pct [status|<5-95>|forced <n>|margin <n>|model <a,b,current|none>|on|off|line|dry-run]", "error");
 		return save({ ...config, percent: p }, `soft line ${p}%`);
 	};
 	pi.registerCommand("compaction-percent", { description: "Compaction thresholds: /compaction-percent [status|<soft%>|forced <n>|margin <n>|model <key>|on|off|line|dry-run]", handler: command });

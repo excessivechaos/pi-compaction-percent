@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.1.0
+
+- `compactionModels`: an ordered list of summarisers instead of one hard-coded model. Tried until one
+  answers, so a quota-blocked provider or a stale key moves to the next entry.
+- `"current"` stands for the model the session is already using (the router's next model when it is
+  known), so a list can always end in something that works. `[]` means pi native.
+- `/compact-pct model a,b,current` edits the list; `/compact-pct model none` hands summarising back to pi.
+- A single `compactionModel` from 2.0 is still read as a one-item list.
+
 ## 2.0.0
 
 - Two thresholds: soft (`percent`, 40) at run end / before a switch, hard (`forcedPercent`, 60) between
