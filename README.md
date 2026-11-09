@@ -14,6 +14,12 @@ soft  40%   at run end, and before a switch to another model
 hard  60%   between the turns of a tool loop, so a long task cannot reach the window
 ```
 
+Both boundaries fire *after* a request, so two cases reach the next turn with no compaction at all:
+resuming a session that is already over the line, and a run the user aborted (an aborted run skips
+`agent_before_settle`). Both now compact **before the first request**, at `session_start` and at
+`agent_settled`, while nothing is running. Without that, a 607k-token resume is billed as a cold
+write first (measured: $4.86 at 1-hour retention) and compacted twenty seconds later.
+
 On a **switch** (the router is about to use a different model than the one that just answered) the
 soft line drops by `marginPercent` (5): if the context is already within a few points of the incoming
 model's line, compacting now beats paying the cold start and compacting a few turns later. The margin
@@ -37,10 +43,14 @@ continuation. The extension returns a **boundary draft** from `agent_before_sett
 return { entries: [...event.entries, { type: "compaction", summary, firstKeptEntryId, usage }] }
 ```
 
-pi appends it without an abort and rebuilds the context before the next request, so the request
-that follows already carries the compacted context. The cut is computed on pi's *projection* (what the
+pi appends it without an abort and rebuilds the context before the next request, so the request that follows already carries the compacted context. The cut is computed on pi's *projection* (what the
 model actually sees), never between a tool call and its result, keeping about `keepRecentTokens` of the
 newest messages and carrying a previous summary forward.
+
+The exception is the upfront path: `session_start` and an aborted run's `agent_settled` have no run
+to abort, so those two use `ctx.compact()` directly and summarise through the same
+`session_before_compact` handler. The first message waits for the result (bounded at 180 s), so the
+request it triggers is already on the compacted context.
 
 Summaries are written by `compactionModels`, an ordered list tried until one answers — a quota-blocked
 provider or a bad key just moves to the next entry. `"current"` means the model this session is already

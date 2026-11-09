@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.1
+
+- Compact **before the first request** after a resume, and after an aborted run. Both reach the next
+  turn with no boundary in between: a resumed session never ran `agent_before_settle`, and pi skips
+  that hook entirely for an aborted run. A 607k-token resume was therefore billed as a full cold
+  write ($4.86 at 1-hour retention) and hard-compacted twenty seconds later.
+- The upfront path uses `ctx.compact()`: nothing is running at `session_start` or `agent_settled`, so
+  there is no continuation to abort. It summarises through the same `session_before_compact` handler,
+  blocks the first message until it finishes, and gives up after 180 s rather than hanging.
+
 ## 2.2.0
 
 - Removed the footer segment and the `statusLine` key: pi's own footer already shows the context

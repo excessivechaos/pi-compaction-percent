@@ -9,6 +9,11 @@
  *   soft   (`percent`, 40)        at run end, and before a switch to another model
  *   hard   (`forcedPercent`, 60)  at turn end, mid tool loop, so a long task cannot reach the window
  *
+ * Both boundaries run *after* a request. Two situations reach a request with no boundary in between:
+ * resuming a session above the line, and a run the user aborted (an aborted run skips
+ * `agent_before_settle`). Those compact before the first request instead, while nothing is running,
+ * so a restart does not pay a cold start on the whole old context just to compact it a turn later.
+ *
  * On a switch to another model the soft line is lowered by `marginPercent` (5): when the context is
  * already within a few points of the incoming model's line it is cheaper to compact now than to pay
  * the cold start and then compact a few turns later.
@@ -328,6 +333,8 @@ const log = (message: string) => {
 };
 
 const FAILURE_BACKOFF_MS = 60_000;
+/** An upfront compaction holds the first message; give up rather than hang if a summariser stalls. */
+const COMPACT_UPFRONT_TIMEOUT_MS = 180_000;
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
 export default function compactionPercent(pi: ExtensionAPI): void {
@@ -529,16 +536,78 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		}
 	};
 
+	/**
+	 * Compact before the first request when no boundary can run first: a resumed session (the run that
+	 * should have ended never did) and a run the user aborted (an aborted run skips
+	 * `agent_before_settle`). Both otherwise reach the next request over the line and pay a cold start
+	 * on the whole old context, which is exactly what the soft line exists to avoid.
+	 *
+	 * `ctx.compact()` is safe at these two points because nothing is in flight: it aborts nothing, and
+	 * its `session_before_compact` path summarises with the same list as the boundary drafts.
+	 */
+	const compactUpFront = async (why: string, ctx: ExtensionContext): Promise<void> => {
+		if (!config.enabled || inFlight) return;
+		const r = resolve(ctx);
+		const decision = decide({
+			config,
+			boundary: "settle",
+			tokens: r.tokens,
+			window: r.window,
+			switching: r.switching,
+			now: Date.now(),
+			backoffUntil,
+			skipBelow,
+		});
+		log(`upfront(${why}) tokens=${r.tokens} window=${r.window} switching=${r.switching} -> ${decision.compact ? `soft (line ${decision.line})` : decision.reason}`);
+		if (!decision.compact) return;
+		if (config.dryRun) {
+			ctx.ui.notify(
+				`compaction-percent: would compact before the first request at ${fmt(decision.tokens)} (line ${fmt(decision.line)} of ${fmt(decision.window)})`,
+				"info",
+			);
+			return;
+		}
+		inFlight = true;
+		const started = Date.now();
+		try {
+			const finished = await new Promise<boolean>((done) => {
+				ctx.compact({ onComplete: () => done(true), onError: () => done(false) });
+				// A summariser that never answers must not hold the first message forever.
+				setTimeout(() => done(false), COMPACT_UPFRONT_TIMEOUT_MS).unref?.();
+			});
+			if (finished) {
+				judge = decision.tokens;
+				skipBelow = undefined;
+				warnedFailure = false;
+			}
+			ctx.ui.notify(
+				`compaction-percent: ${finished ? "compacted" : "could not compact"} before the first request at ${fmt(decision.tokens)} (line ${fmt(decision.line)} of ${fmt(decision.window)}) in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+				finished ? "info" : "warning",
+			);
+		} finally {
+			inFlight = false;
+		}
+	};
+
 	// Soft boundary: the run is ending and nothing is in flight; the router's pending continuation, if
 	// any, sees the compacted context because the boundary rebuilds it after every handler.
 	pi.on("agent_before_settle", (event, ctx) => atBoundary("settle", event as never, ctx) as never);
 	// Hard boundary: between the turns of a tool loop.
 	pi.on("turn_end", (event, ctx) => atBoundary("turn", event as never, ctx) as never);
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
 		keepRecentCache = undefined;
 		warnedNoNext = warnedNoModel = warnedFailure = false;
 		skipBelow = backoffUntil = undefined;
+		// Resuming is the one start with no boundary before the first request: compact now, at the
+		// small context, instead of after a cold start on the old one.
+		await compactUpFront("resume", ctx);
+	});
+	// An aborted run skips `agent_before_settle`, so it too reaches the next message over the line.
+	// Nothing is running by the time `agent_settled` fires, so this cannot abort the user's work.
+	pi.on("agent_settled", async (event, ctx) => {
+		if (!event.aborted) return;
+		await compactUpFront("aborted-run", ctx);
 	});
 	pi.on("session_compact", () => {
 		skipBelow = undefined;
