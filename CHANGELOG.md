@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.3.0
+
+- **The lines are token counts, not percentages of the window.** `softTokens` (250k) and `hardTokens`
+  (300k) apply to every model that can hold them: a 500k window now compacts at 250k instead of at 25%
+  of its window (125k). Only the ceiling moves — a model that cannot hold the hard line uses
+  `hardWindowFraction` (90%) of its window, and the soft line keeps `softGapTokens` below it (capped at
+  a quarter of the hard line for very small windows).
+- `marginPercent` became `marginTokens` (50k): the switch margin and the cold-cache band are now
+  absolute too, so they do not shrink to 25k on a 500k model.
+- Commands take counts with `k`/`m` suffixes: `/compact-pct 250k`, `/compact-pct hard 300k`,
+  `/compact-pct margin 50k`, plus `/compact-pct fraction 0.9` for the ceiling.
+- `percent` / `forcedPercent` / `marginPercent` are no longer read. An old config file is ignored and
+  the defaults apply, so a session that edits the file by hand should be updated once.
+
 ## 2.2.2
 
 - Compact before a request that would write the whole prefix anyway. When the provider's cache entry

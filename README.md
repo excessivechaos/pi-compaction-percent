@@ -10,15 +10,27 @@ works at the boundaries instead.
 ## The two lines
 
 ```
-soft  40%   at run end, and before a switch to another model
-hard  60%   between the turns of a tool loop, so a long task cannot reach the window
+soft  250,000 tokens   at run end, before a switch, and when the cache has expired
+hard  300,000 tokens   between the turns of a tool loop, so a long task cannot reach the window
+```
+
+They are token counts, not percentages. Carrying context costs the same per token on a 500k model as
+on a 1M one, so the right threshold is an absolute number: a 1M window and a 500k window both compact
+at 250k, and only the ceiling moves. A model that cannot hold the hard line uses
+`hardWindowFraction` (90%) of its window instead, and the soft line keeps its gap below it:
+
+```
+1M window      soft 250k   hard 300k          (as configured)
+500k window    soft 250k   hard 300k          (same numbers; 50%/60% of the window)
+272k window    soft 195k   hard 245k          (hard = 90% of the window, 50k gap)
+100k window    soft 68k    hard 90k           (gap shrinks to a quarter of the hard line)
 ```
 
 A third trigger is the cache expiring. After the entry's TTL (one hour under `PI_CACHE_RETENTION=long`)
 the provider charges a full write of the whole prefix, so the next request costs the same whether or not
 the context was compacted — except that compacting first writes ~55k instead of everything. When the last
-assistant message is older than the model's `promptCache` tier and the context is within `marginPercent`
-(5 points) of the soft line, the extension compacts before that request. This is the case an unanswered
+assistant message is older than the model's `promptCache` tier and the context is within `marginTokens`
+of the soft line, the extension compacts before that request. This is the case an unanswered
 question or a long blocking tool produces: the run is still open, nothing refreshed the cache, and the turn
 that resolves it would pay for the entire prefix.
 
@@ -29,18 +41,15 @@ and at `agent_settled`, while nothing is running. Without that, a 607k-token res
 write first (measured: $4.86 at 1-hour retention) and compacted twenty seconds later.
 
 On a **switch** (the router is about to use a different model than the one that just answered) the
-soft line drops by `marginPercent` (5): if the context is already within a few points of the incoming
-model's line, compacting now beats paying the cold start and compacting a few turns later. The same
-`marginPercent` also sets the width of the cold band below the soft line.
+soft line drops by `marginTokens` (50k): if the context is already that close to the incoming model's
+line, compacting now beats paying the cold start and compacting a few turns later. The same
+`marginTokens` sets the width of the cold band below the soft line.
 
 ```
-opus at 300k, router falls back to sol (500k):    line = 35% × 500k = 175k   -> compact first
-opus at 150k, same fallback:                      under the line             -> just switch
-no switch, 500k window:                           line = 40% × 500k = 200k
+context 230k, router falls back to another model:   line = 250k - 50k = 200k   -> compact first
+context 180k, same fallback:                        under the line             -> just switch
+no switch:                                          line = 250k
 ```
-
-`percent` and `forcedPercent` are of the *next* model's window, so the same rule works on a 1M, a
-500k and a 256k rung without a per-model table.
 
 ## How it compacts
 
@@ -111,9 +120,11 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 
 | key | default | meaning |
 | --- | --- | --- |
-| `percent` | 40 | soft line, % of the next model's window (5–95) |
-| `forcedPercent` | 60 | hard line, mid tool loop; never below `percent` |
-| `marginPercent` | 5 | soft line is lowered by this on a switch (0–20) |
+| `softTokens` | 250000 | soft line in tokens: run end, before a switch, cold cache |
+| `hardTokens` | 300000 | hard line in tokens, mid tool loop |
+| `hardWindowFraction` | 0.9 | a model that cannot hold `hardTokens` uses this much of its window |
+| `softGapTokens` | 50000 | distance from the hard line down to the soft line (capped at ¼ of hard) |
+| `marginTokens` | 50000 | switch margin, and the width of the cold band below the soft line |
 | `compactionModels` | `["current"]` | summarisers tried in order; `"current"` = the model already serving; `[]` = pi native |
 | `dryRun` | false | decide and log, never write |
 
@@ -121,9 +132,10 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 
 ```
 /compact-pct                  status: next model, window, soft/hard lines, switching?
-/compact-pct 40               soft line
-/compact-pct forced 60        hard line
-/compact-pct margin 5         switch margin
+/compact-pct 250k             soft line (k/m suffixes, or a plain count)
+/compact-pct hard 300k        hard line
+/compact-pct margin 50k       switch and cold-cache margin
+/compact-pct fraction 0.9     ceiling on the hard line, as a fraction of the window
 /compact-pct model beam:free,current   ordered list ("none" = pi native)
 /compact-pct on|off|dry-run
 ```

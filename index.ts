@@ -6,8 +6,11 @@
  * the model that will serve the NEXT request, and does the work at the boundaries where compacting
  * is cheapest:
  *
- *   soft   (`percent`, 40)        at run end, and before a switch to another model
- *   hard   (`forcedPercent`, 60)  at turn end, mid tool loop, so a long task cannot reach the window
+ *   soft   (`softTokens`, 250k)   at run end, before a switch, and when the cache has expired
+ *   hard   (`hardTokens`, 300k)   at turn end, mid tool loop, so a long task cannot reach the window
+ *
+ * They are token counts, not percentages: carrying context costs the same per token on a 500k model as
+ * on a 1M one. A model that cannot hold the hard line caps at `hardWindowFraction` (90%) of its window.
  *
  * Both boundaries run *after* a request. Three situations reach a request with no boundary in between:
  * resuming a session above the line, a run the user aborted (an aborted run skips
@@ -15,9 +18,9 @@
  * compact before the request instead, while nothing is running, so the write that is coming anyway is
  * a small one.
  *
- * On a switch to another model the soft line is lowered by `marginPercent` (5): when the context is
- * already within a few points of the incoming model's line it is cheaper to compact now than to pay
- * the cold start and then compact a few turns later.
+ * On a switch to another model the soft line is lowered by `marginTokens` (50k): when the context is
+ * already that close to the incoming model's line it is cheaper to compact now than to pay the cold
+ * start and then compact a few turns later. The same margin sets the cold band below the soft line.
  *
  * Mechanism. Compaction is written as a boundary DRAFT (`agent_before_settle` / `turn_end`
  * returning `{ entries: [{ type: "compaction", ... }] }`), never `ctx.compact()`, which aborts the
@@ -64,12 +67,16 @@ function peekNext(ctx: ExtensionContext): string | undefined {
 
 export interface CompactionPercentConfig {
 	enabled: boolean;
-	/** Soft line: compact at run end / before a switch once context passes this % of the window. */
-	percent: number;
-	/** Hard line: compact between turns of a tool loop once context passes this % of the window. */
-	forcedPercent: number;
-	/** On a switch, the soft line drops by this many points. */
-	marginPercent: number;
+	/** Soft line in tokens: compact at run end, before a switch, or when the cache has expired. */
+	softTokens: number;
+	/** Hard line in tokens: compact between turns of a tool loop. */
+	hardTokens: number;
+	/** A model that cannot hold `hardTokens` uses this fraction of its window instead (0.9). */
+	hardWindowFraction: number;
+	/** Distance from the hard line down to the soft line; capped at a quarter of the hard line. */
+	softGapTokens: number;
+	/** How far below the soft line still counts as "at the line" on a switch or a cold cache. */
+	marginTokens: number;
 	/**
 	 * Summarisers, tried in order. Each entry is a `provider/id` (a router virtual model is fine) or
 	 * `"current"` for the model this session is already using. Empty: pi summarises itself.
@@ -81,18 +88,35 @@ export interface CompactionPercentConfig {
 
 export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	enabled: true,
-	percent: 40,
-	forcedPercent: 60,
-	marginPercent: 5,
+	softTokens: 250_000,
+	hardTokens: 300_000,
+	hardWindowFraction: 0.9,
+	softGapTokens: 50_000,
+	marginTokens: 50_000,
 	compactionModels: ["current"],
 	dryRun: false,
 };
 
-export function clampPercent(value: unknown, min = 5, max = 95): number | undefined {
+/** A token count: a positive integer, or the fallback. */
+export function readTokens(value: unknown, fallback: number): number {
 	const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
-	if (typeof n !== "number" || !Number.isFinite(n)) return undefined;
-	const rounded = Math.round(n);
-	return rounded < min || rounded > max ? undefined : rounded;
+	return typeof n === "number" && Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+}
+
+/** `250k`, `1.2m` or `250000` -> tokens; undefined when it is not a count. */
+export function readTokenArg(value: unknown): number | undefined {
+	if (typeof value === "number") return Number.isFinite(value) && value > 0 ? Math.round(value) : undefined;
+	if (typeof value !== "string") return undefined;
+	const match = /^([0-9]+(?:\.[0-9]+)?)\s*([km])?$/i.exec(value.trim());
+	if (!match) return undefined;
+	const n = Number(match[1]) * (match[2]?.toLowerCase() === "k" ? 1_000 : match[2]?.toLowerCase() === "m" ? 1_000_000 : 1);
+	return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined;
+}
+
+/** A fraction of the window in (0, 1]. */
+export function readFraction(value: unknown, fallback: number): number {
+	const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
+	return typeof n === "number" && Number.isFinite(n) && n > 0 && n <= 1 ? n : fallback;
 }
 
 /** Accept `compactionModels: [...]`, and the single `compactionModel` of 2.0 as a one-item list. */
@@ -127,7 +151,16 @@ export function summariserKeys(models: readonly string[], currentKey: string | u
 
 /** Keep the hard line at or above the soft line, whatever the file says. */
 export function normalize(config: CompactionPercentConfig): CompactionPercentConfig {
-	return config.forcedPercent < config.percent ? { ...config, forcedPercent: config.percent } : config;
+	const hard = Math.max(1_000, readTokens(config.hardTokens, DEFAULT_CONFIG.hardTokens));
+	const soft = Math.min(readTokens(config.softTokens, DEFAULT_CONFIG.softTokens), hard - 1_000);
+	return {
+		...config,
+		hardTokens: hard,
+		softTokens: Math.max(1_000, soft),
+		hardWindowFraction: readFraction(config.hardWindowFraction, DEFAULT_CONFIG.hardWindowFraction),
+		softGapTokens: readTokens(config.softGapTokens, DEFAULT_CONFIG.softGapTokens),
+		marginTokens: readTokens(config.marginTokens, DEFAULT_CONFIG.marginTokens),
+	};
 }
 
 export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
@@ -136,9 +169,11 @@ export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 		const raw = JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
 		return normalize({
 			enabled: typeof raw.enabled === "boolean" ? raw.enabled : DEFAULT_CONFIG.enabled,
-			percent: clampPercent(raw.percent) ?? DEFAULT_CONFIG.percent,
-			forcedPercent: clampPercent(raw.forcedPercent) ?? DEFAULT_CONFIG.forcedPercent,
-			marginPercent: clampPercent(raw.marginPercent, 0, 20) ?? DEFAULT_CONFIG.marginPercent,
+			softTokens: readTokens(raw.softTokens, DEFAULT_CONFIG.softTokens),
+			hardTokens: readTokens(raw.hardTokens, DEFAULT_CONFIG.hardTokens),
+			hardWindowFraction: readFraction(raw.hardWindowFraction, DEFAULT_CONFIG.hardWindowFraction),
+			softGapTokens: readTokens(raw.softGapTokens, DEFAULT_CONFIG.softGapTokens),
+			marginTokens: readTokens(raw.marginTokens, DEFAULT_CONFIG.marginTokens),
 			compactionModels: readModels(raw),
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
 		});
@@ -171,10 +206,17 @@ export interface Lines {
 	hard: number;
 }
 
-/** Token lines for a window. A switch lowers the soft line by the margin. */
+/**
+ * Absolute token lines. Carrying context costs the same per token on a 500k model as on a 1M one, so
+ * the lines are counts, not percentages: `hardTokens` with `softTokens` below it. A model that cannot
+ * hold the hard line gets `hardWindowFraction` of its window instead, and the soft line keeps its gap.
+ * A switch lowers the soft line by `marginTokens`.
+ */
 export function lines(config: CompactionPercentConfig, window: number, switching: boolean): Lines {
-	const soft = Math.max(0, config.percent - (switching ? config.marginPercent : 0));
-	return { soft: Math.floor((window * soft) / 100), hard: Math.floor((window * config.forcedPercent) / 100) };
+	const hard = Math.max(0, Math.min(config.hardTokens, Math.floor(window * config.hardWindowFraction)));
+	const gap = Math.min(config.softGapTokens, Math.floor(hard / 4));
+	const soft = Math.max(0, Math.min(config.softTokens, hard - gap));
+	return { soft: Math.max(0, soft - (switching ? config.marginTokens : 0)), hard };
 }
 
 export type Decision =
@@ -216,7 +258,7 @@ export function decide(input: {
 	// Cold cache: pay a summary now instead of writing the whole context on the next request. Only
 	// when a request is actually next — a settle, or a turn that still has a tool loop to run.
 	if (cacheCold === true && (boundary === "settle" || loopContinues === true)) {
-		const coldLine = Math.max(0, l.soft - Math.floor((window * config.marginPercent) / 100));
+		const coldLine = Math.max(0, l.soft - config.marginTokens);
 		if (tokens >= coldLine) return { compact: true, tier: "cold", tokens, line: coldLine, window };
 	}
 	if (boundary === "settle") {
@@ -693,7 +735,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		const r = resolve(ctx);
 		const l = r.window === undefined ? undefined : lines(config, r.window, r.switching);
 		return [
-			`compaction-percent ${config.enabled ? "on" : "off"} · soft ${config.percent}% · hard ${config.forcedPercent}% · switch margin ${config.marginPercent}%${config.dryRun ? " · dry-run" : ""}`,
+			`compaction-percent ${config.enabled ? "on" : "off"} · soft ${fmt(config.softTokens)} · hard ${fmt(config.hardTokens)} (≤${Math.round(config.hardWindowFraction * 100)}% of window) · margin ${fmt(config.marginTokens)}${config.dryRun ? " · dry-run" : ""}`,
 			`next model ${r.next ? `${r.next.model} (${r.next.source})` : ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"}${r.switching ? " · SWITCHING" : ""} · window ${r.window === undefined ? "—" : r.window.toLocaleString()}`,
 			`context ${r.tokens === undefined ? "—" : r.tokens.toLocaleString()}${l ? ` · soft line ${l.soft.toLocaleString()} · hard line ${l.hard.toLocaleString()}` : ""}`,
 			`summaries by ${config.compactionModels.join(" -> ") || "(pi native)"} · ${CONFIG_PATH}`,
@@ -717,17 +759,21 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			const models = readModels({ compactionModels: value.split(",").map((v) => v.trim()).filter(Boolean) });
 			return save({ ...config, compactionModels: models }, `summaries by ${models.join(" -> ")}`);
 		}
-		if (verb === "forced" || verb === "hard") {
-			const p = clampPercent(value);
-			return p === undefined ? ctx.ui.notify("hard line: a percentage from 5 to 95", "error") : save({ ...config, forcedPercent: p }, `hard line ${p}%`);
+		if (verb === "hard" || verb === "forced") {
+			const n = readTokens(value, 0);
+			return n === 0 ? ctx.ui.notify("hard line: a token count, for example /compact-pct hard 300k", "error") : save({ ...config, hardTokens: n }, `hard line ${fmt(n)}`);
 		}
 		if (verb === "margin") {
-			const p = clampPercent(value, 0, 20);
-			return p === undefined ? ctx.ui.notify("margin: 0 to 20", "error") : save({ ...config, marginPercent: p }, `switch margin ${p}%`);
+			const n = readTokens(value, 0);
+			return n === 0 ? ctx.ui.notify("margin: a token count, for example /compact-pct margin 50k", "error") : save({ ...config, marginTokens: n }, `margin ${fmt(n)}`);
 		}
-		const p = clampPercent(verb === "soft" ? value : verb);
-		if (p === undefined) return ctx.ui.notify("usage: /compact-pct [status|<5-95>|forced <n>|margin <n>|model <a,b,current|none>|on|off|dry-run]", "error");
-		return save({ ...config, percent: p }, `soft line ${p}%`);
+		if (verb === "fraction" || verb === "window") {
+			const f = readFraction(value, 0);
+			return f === 0 ? ctx.ui.notify("fraction: 0 < f ≤ 1, for example /compact-pct fraction 0.9", "error") : save({ ...config, hardWindowFraction: f }, `hard line caps at ${Math.round(f * 100)}% of the window`);
+		}
+		const n = readTokenArg(verb === "soft" ? value : verb);
+		if (n === undefined) return ctx.ui.notify("usage: /compact-pct [status|<tokens, e.g. 250k>|soft <n>|hard <n>|margin <n>|fraction <f>|model <a,b,current|none>|on|off|dry-run]", "error");
+		return save({ ...config, softTokens: n }, `soft line ${fmt(n)}`);
 	};
 	pi.registerCommand("compaction-percent", { description: "Compaction thresholds: /compaction-percent [status|<soft%>|forced <n>|margin <n>|model <key>|on|off|line|dry-run]", handler: command });
 	pi.registerCommand("compact-pct", { description: "Alias for /compaction-percent", handler: command });
