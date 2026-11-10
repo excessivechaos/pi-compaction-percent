@@ -10,9 +10,10 @@
  *   hard   (`forcedPercent`, 60)  at turn end, mid tool loop, so a long task cannot reach the window
  *
  * Both boundaries run *after* a request. Three situations reach a request with no boundary in between:
- * resuming a session above the line, and a run the user aborted (an aborted run skips
- * `agent_before_settle`). Those compact before the first request instead, while nothing is running,
- * so a restart does not pay a cold start on the whole old context just to compact it a turn later.
+ * resuming a session above the line, a run the user aborted (an aborted run skips
+ * `agent_before_settle`), and a cache that expired while a tool or a question held the run open. Those
+ * compact before the request instead, while nothing is running, so the write that is coming anyway is
+ * a small one.
  *
  * On a switch to another model the soft line is lowered by `marginPercent` (5): when the context is
  * already within a few points of the incoming model's line it is cheaper to compact now than to pay
