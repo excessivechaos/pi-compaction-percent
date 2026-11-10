@@ -31,6 +31,16 @@ eq(d({ boundary: "settle", tokens: 300_000, switching: true }), { compact: true,
 eq(d({ boundary: "settle", tokens: 150_000, switching: true }).compact, false, "150k before the same switch does not");
 eq(d({ boundary: "settle", tokens: 180_000, switching: false }).compact, false, "margin does NOT apply without a switch (180k < 200k)");
 eq(d({ boundary: "settle", tokens: 180_000, switching: true }).compact, true, "margin applies on a switch (180k >= 175k)");
+// ---- decide: cold cache -----------------------------------------------------------------------
+// soft 40% of 1M = 400k; margin 5 -> the cold band starts at 350k
+const cold = { boundary: "settle", window: 1_000_000, cacheCold: true };
+eq(d({ ...cold, tokens: 349_999 }).compact, false, "cold just under the band does not compact");
+eq(d({ ...cold, tokens: 350_000 }), { compact: true, tier: "cold", tokens: 350_000, line: 350_000, window: 1_000_000 }, "cold at the band compacts before the write");
+eq(d({ ...cold, tokens: 300_000, cacheCold: false }).reason, "below", "warm cache keeps the plain soft line");
+eq(d({ boundary: "turn", window: 1_000_000, cacheCold: true, loopContinues: true, tokens: 350_000 }).tier, "cold", "cold turn with a live loop compacts");
+eq(d({ boundary: "turn", window: 1_000_000, cacheCold: true, loopContinues: false, tokens: 350_000 }).reason, "deferred-to-settle", "cold turn without a loop defers to settle");
+eq(d({ ...cold, tokens: 350_000, config: C({ marginPercent: 10 }) }).line, 300_000, "a wider margin lowers the cold band");
+
 // ---- decide: turn -----------------------------------------------------------------------------
 eq(d({ boundary: "turn", tokens: 400_000, loopContinues: false }).reason, "deferred-to-settle", "no tool results defers to settle");
 eq(d({ boundary: "turn", tokens: 250_000, loopContinues: true }).compact, false, "tool loop below hard line (300k)");

@@ -9,7 +9,7 @@
  *   soft   (`percent`, 40)        at run end, and before a switch to another model
  *   hard   (`forcedPercent`, 60)  at turn end, mid tool loop, so a long task cannot reach the window
  *
- * Both boundaries run *after* a request. Two situations reach a request with no boundary in between:
+ * Both boundaries run *after* a request. Three situations reach a request with no boundary in between:
  * resuming a session above the line, and a run the user aborted (an aborted run skips
  * `agent_before_settle`). Those compact before the first request instead, while nothing is running,
  * so a restart does not pay a cold start on the whole old context just to compact it a turn later.
@@ -177,7 +177,7 @@ export function lines(config: CompactionPercentConfig, window: number, switching
 }
 
 export type Decision =
-	| { compact: true; tier: "soft" | "hard"; tokens: number; line: number; window: number }
+	| { compact: true; tier: "soft" | "hard" | "cold"; tokens: number; line: number; window: number }
 	| { compact: false; reason: string };
 
 /**
@@ -185,6 +185,11 @@ export type Decision =
  *   settle: the run is ending, nothing is in flight -> soft line (lowered on a switch).
  *   turn:   a tool loop continues -> a pending switch uses the lowered soft line, otherwise the
  *           hard line. A turn with no tool results defers to settle.
+ *
+ * A cold cache is its own trigger: whatever happens next is a full write of the whole prefix, so
+ * compacting first — one summary plus a small write — is cheaper as soon as the context is near the
+ * soft line. `cacheCold` is measured against the provider's TTL, and the band is `marginPercent`
+ * below the soft line.
  */
 export function decide(input: {
 	config: CompactionPercentConfig;
@@ -194,17 +199,25 @@ export function decide(input: {
 	switching: boolean;
 	/** `turn` only: the turn issued tool calls, so another request follows. */
 	loopContinues?: boolean;
+	/** The cached prefix has expired: the next request is a full write either way. */
+	cacheCold?: boolean;
 	now: number;
 	backoffUntil?: number;
 	skipBelow?: number;
 }): Decision {
-	const { config, boundary, tokens, window, switching, loopContinues, now, backoffUntil, skipBelow } = input;
+	const { config, boundary, tokens, window, switching, loopContinues, cacheCold, now, backoffUntil, skipBelow } = input;
 	if (!config.enabled) return { compact: false, reason: "disabled" };
 	if (tokens === undefined) return { compact: false, reason: "no-usage" };
 	if (window === undefined || window <= 0) return { compact: false, reason: "no-window" };
 	if (backoffUntil !== undefined && now < backoffUntil) return { compact: false, reason: "backoff" };
 	if (skipBelow !== undefined && tokens < skipBelow) return { compact: false, reason: "nothing-to-compact" };
 	const l = lines(config, window, switching);
+	// Cold cache: pay a summary now instead of writing the whole context on the next request. Only
+	// when a request is actually next — a settle, or a turn that still has a tool loop to run.
+	if (cacheCold === true && (boundary === "settle" || loopContinues === true)) {
+		const coldLine = Math.max(0, l.soft - Math.floor((window * config.marginPercent) / 100));
+		if (tokens >= coldLine) return { compact: true, tier: "cold", tokens, line: coldLine, window };
+	}
 	if (boundary === "settle") {
 		return tokens >= l.soft ? { compact: true, tier: "soft", tokens, line: l.soft, window } : { compact: false, reason: "below" };
 	}
@@ -374,6 +387,30 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		return { tokens, window, switching, next };
 	};
 
+	/**
+	 * Whether the provider's cache entry for this session has expired, in which case the next request
+	 * writes the whole prefix whatever we do. Measured from the last assistant message: only provider
+	 * requests refresh a cache entry, so a tool that ran for an hour does not count as activity.
+	 */
+	const cacheState = (ctx: ExtensionContext, nextKey: string | undefined): { cold: boolean; ageMs?: number; ttlMs: number } => {
+		const retention = process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
+		const parts = nextKey === undefined ? undefined : splitModelKey(nextKey);
+		const model = (parts !== undefined ? ctx.modelRegistry.find(parts.provider, parts.id) : ctx.model) as
+			| { promptCache?: { short?: number; long?: number } }
+			| undefined;
+		const ttlMs = (model?.promptCache?.[retention] ?? (retention === "long" ? 3600 : 300)) * 1000;
+		const entries = ctx.sessionManager.getEntries() as SessionEntry[];
+		for (let i = entries.length - 1; i >= 0; i--) {
+			const entry = entries[i] as unknown as { type?: string; timestamp?: string; message?: { role?: string } };
+			if (entry.type !== "message" || entry.message?.role !== "assistant" || typeof entry.timestamp !== "string") continue;
+			const at = Date.parse(entry.timestamp);
+			if (!Number.isFinite(at)) continue;
+			const ageMs = Date.now() - at;
+			return { cold: ageMs > ttlMs, ageMs, ttlMs };
+		}
+		return { cold: false, ttlMs };
+	};
+
 	/** The summarisers to try, in order, resolved against the registry. `"current"` is the next model. */
 	const summaryModels = (ctx: ExtensionContext) => {
 		const r = resolve(ctx);
@@ -454,7 +491,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		const result = await summarise(ctx, cut.messages, cut.previousSummary);
 		if (!result) throw new Error(`no summariser answered (${config.compactionModels.join(", ")})`);
 		ctx.ui.notify(
-			`compaction-percent: ${decision.tier} compaction at ${fmt(decision.tokens)} of ${fmt(decision.window)} (${decision.tier === "soft" ? config.percent - (switching ? config.marginPercent : 0) : config.forcedPercent}%)` +
+			`compaction-percent: ${decision.tier} compaction at ${fmt(decision.tokens)} of ${fmt(decision.window)} (${Math.round((decision.line / decision.window) * 100)}%)` +
 				`${switching && nextKey ? `, before switching to ${nextKey}` : ""} · summary by ${result.key} in ${((Date.now() - started) / 1000).toFixed(1)}s`,
 			"info",
 		);
@@ -494,6 +531,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			judge = undefined;
 		}
 		if (inFlight) return undefined;
+		const cache = cacheState(ctx, r.next?.model);
 		const decision = decide({
 			config,
 			boundary,
@@ -501,11 +539,14 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			window: r.window,
 			switching: r.switching,
 			loopContinues: boundary === "turn" ? (event.toolResults?.length ?? 0) > 0 && event.outcome === "completed" : undefined,
+			cacheCold: cache.cold,
 			now: Date.now(),
 			backoffUntil,
 			skipBelow,
 		});
-		log(`${boundary} tokens=${r.tokens} window=${r.window} next=${r.next?.model ?? "-"} switching=${r.switching} -> ${decision.compact ? `${decision.tier} (line ${decision.line})` : decision.reason}`);
+		log(
+			`${boundary} tokens=${r.tokens} window=${r.window} next=${r.next?.model ?? "-"} switching=${r.switching} cold=${cache.cold}${cache.ageMs === undefined ? "" : ` age=${Math.round(cache.ageMs / 60_000)}m/${Math.round(cache.ttlMs / 60_000)}m`} -> ${decision.compact ? `${decision.tier} (line ${decision.line})` : decision.reason}`,
+		);
 		if (!decision.compact) return undefined;
 		if (config.dryRun) {
 			ctx.ui.notify(`compaction-percent: would ${decision.tier}-compact at ${fmt(decision.tokens)} (line ${fmt(decision.line)} of ${fmt(decision.window)})`, "info");
@@ -548,17 +589,19 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	const compactUpFront = async (why: string, ctx: ExtensionContext): Promise<void> => {
 		if (!config.enabled || inFlight) return;
 		const r = resolve(ctx);
+		const cache = cacheState(ctx, r.next?.model);
 		const decision = decide({
 			config,
 			boundary: "settle",
 			tokens: r.tokens,
 			window: r.window,
 			switching: r.switching,
+			cacheCold: cache.cold,
 			now: Date.now(),
 			backoffUntil,
 			skipBelow,
 		});
-		log(`upfront(${why}) tokens=${r.tokens} window=${r.window} switching=${r.switching} -> ${decision.compact ? `soft (line ${decision.line})` : decision.reason}`);
+		log(`upfront(${why}) tokens=${r.tokens} window=${r.window} switching=${r.switching} cold=${cache.cold}${cache.ageMs === undefined ? "" : ` age=${Math.round(cache.ageMs / 60_000)}m`} -> ${decision.compact ? `${decision.tier} (line ${decision.line})` : decision.reason}`);
 		if (!decision.compact) return;
 		if (config.dryRun) {
 			ctx.ui.notify(

@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.2.2
+
+- Compact before a request that would write the whole prefix anyway. When the provider's cache entry
+  has expired (the model's `promptCache` tier — one hour under `PI_CACHE_RETENTION=long`) and the
+  context is within `marginPercent` (5 points) of the soft line, the boundary compacts even though it
+  is below the line. Observed: an unanswered question sat for 62 minutes, then the turn that answered
+  it paid a full write of the whole context.
+- The age is measured from the last assistant message, not the last session entry: a long-running
+  tool does not refresh a provider cache entry, so a tool result two hours later still means cold.
+
 ## 2.2.1
 
 - Compact **before the first request** after a resume, and after an aborted run. Both reach the next

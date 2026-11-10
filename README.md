@@ -14,16 +14,24 @@ soft  40%   at run end, and before a switch to another model
 hard  60%   between the turns of a tool loop, so a long task cannot reach the window
 ```
 
-Both boundaries fire *after* a request, so two cases reach the next turn with no compaction at all:
-resuming a session that is already over the line, and a run the user aborted (an aborted run skips
-`agent_before_settle`). Both now compact **before the first request**, at `session_start` and at
-`agent_settled`, while nothing is running. Without that, a 607k-token resume is billed as a cold
+A third trigger is the cache expiring. After the entry's TTL (one hour under `PI_CACHE_RETENTION=long`)
+the provider charges a full write of the whole prefix, so the next request costs the same whether or not
+the context was compacted — except that compacting first writes ~55k instead of everything. When the last
+assistant message is older than the model's `promptCache` tier and the context is within `marginPercent`
+(5 points) of the soft line, the extension compacts before that request. This is the case an unanswered
+question or a long blocking tool produces: the run is still open, nothing refreshed the cache, and the turn
+that resolves it would pay for the entire prefix.
+
+The settle and turn boundaries otherwise fire *after* a request, so two other cases reach the next turn
+with no compaction at all: resuming a session that is already over the line, and a run the user aborted
+(an aborted run skips `agent_before_settle`). Both compact **before the first request**, at `session_start`
+and at `agent_settled`, while nothing is running. Without that, a 607k-token resume is billed as a cold
 write first (measured: $4.86 at 1-hour retention) and compacted twenty seconds later.
 
 On a **switch** (the router is about to use a different model than the one that just answered) the
 soft line drops by `marginPercent` (5): if the context is already within a few points of the incoming
-model's line, compacting now beats paying the cold start and compacting a few turns later. The margin
-applies *only* on a switch.
+model's line, compacting now beats paying the cold start and compacting a few turns later. The same
+`marginPercent` also sets the width of the cold band below the soft line.
 
 ```
 opus at 300k, router falls back to sol (500k):    line = 35% × 500k = 175k   -> compact first
