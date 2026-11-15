@@ -1,5 +1,20 @@
 # Changelog
 
+## 2.5.0
+
+- **A user model switch is a bust of its own.** `model_select` with source `set` or `cycle` marks the
+  next decision as `bust: "switch"`: the model the user just picked has never seen this prefix, so the
+  next request writes all of it. Works for any pair of selected models — `opus -> router/*`,
+  `router/* -> opus`, or two concrete models — because the comparison is on the *selected* model.
+- **The router's internal choices are not switches.** It registers virtual models and resolves per
+  request; it never calls `setModel`, so it emits no `model_select`. The extension sees no event and
+  does nothing, which is the point: routing is not a user decision.
+- A switch is decided when the next run starts (`before_agent_start`), not when it happens: switching
+  and switching back without sending a message costs nothing. A switch followed by a reload is picked
+  up at `session_start` by comparing the recorded selected model with the current one.
+- Consumed once per switch, whether or not it fires: below the line there is nothing to compact, and a
+  flag left over would later look like a bust on a warm cache.
+
 # Changelog
 
 ## 2.4.0

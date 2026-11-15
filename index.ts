@@ -241,7 +241,7 @@ export type Decision =
 	| { compact: false; reason: string };
 
 /** Why the cached prefix is going to be rewritten no matter what. */
-export type BustReason = "expired" | "drift";
+export type BustReason = "expired" | "drift" | "switch";
 
 /**
  * Pure rule.
@@ -326,18 +326,50 @@ export function promptFingerprint(text: string): string {
 	return `${text.length}:${hash.toString(16).padStart(8, "0")}`;
 }
 
+export interface PromptRecord {
+	fingerprint?: string;
+	/** The *selected* model the prompt was sent under; the router's own choices are not recorded. */
+	model?: string;
+}
+
 /**
- * The fingerprint of the prompt the model was last sent, from this session's own record.
- * `undefined` when this session predates the record: an unknown baseline is not a drift.
+ * The newest prompt record in this session. `{}` when the session predates the record:
+ * an unknown baseline is neither a drift nor a switch.
  */
-export function lastSentPrompt(entries: readonly { type?: string; customType?: string; data?: unknown }[]): string | undefined {
+export function lastSentPromptRecord(entries: readonly { type?: string; customType?: string; data?: unknown }[]): PromptRecord {
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		if (entry?.type !== "custom" || entry.customType !== PROMPT_ENTRY) continue;
-		const data = entry.data as { fingerprint?: unknown } | undefined;
-		if (typeof data?.fingerprint === "string") return data.fingerprint;
+		const data = entry.data as PromptRecord | undefined;
+		const record: PromptRecord = {};
+		if (typeof data?.fingerprint === "string") record.fingerprint = data.fingerprint;
+		if (typeof data?.model === "string") record.model = data.model;
+		return record;
 	}
-	return undefined;
+	return {};
+}
+
+/** The fingerprint of the prompt the model was last sent. */
+export function lastSentPrompt(entries: readonly { type?: string; customType?: string; data?: unknown }[]): string | undefined {
+	return lastSentPromptRecord(entries).fingerprint;
+}
+
+/** `model_select` sources that mean the user chose this model. The router never emits one. */
+export const USER_MODEL_SOURCES: readonly string[] = ["set", "cycle"];
+
+/** True when the user picked this model, as opposed to the router or a restore. */
+export function isUserModelSwitch(source: unknown): boolean {
+	return typeof source === "string" && USER_MODEL_SOURCES.includes(source);
+}
+
+/**
+ * True when the selected model differs from the one the last request was sent under: a
+ * switch the user made, possibly followed by a reload before any request went out.
+ * A virtual `router/*` model is the selected model both times, so its internal routing
+ * never shows up here.
+ */
+export function switchedSinceLastRequest(record: PromptRecord, currentKey: string | undefined): boolean {
+	return record.model !== undefined && currentKey !== undefined && record.model !== currentKey;
 }
 
 /** `provider/id` of the newest assistant response, and the index it sits at. */
@@ -449,6 +481,8 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	let config = loadConfig();
 	/** Fingerprint of the system prompt the model was last sent, for the drift check. */
 	let sentPrompt: string | undefined;
+	/** A model the user picked that has not yet seen a request; consumed by the next decision. */
+	let pendingSwitch: { to: string } | undefined;
 	let inFlight = false;
 	let backoffUntil: number | undefined;
 	let skipBelow: number | undefined;
@@ -496,11 +530,15 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	 * start, so an edited AGENTS.md changes the head under a warm cache.
 	 */
 	const bustReason = (ctx: ExtensionContext, cache: { cold: boolean }): BustReason | undefined => {
+		// The user's own switch: this model has never seen the prefix, so the next request
+		// writes all of it. Consumed here — one decision per switch, whether or not it fires.
+		const switched = pendingSwitch;
+		pendingSwitch = undefined;
+		if (switched !== undefined) return "switch";
 		if (cache.cold) return "expired";
 		// Lazy: the baseline is read on first use, so this does not depend on which
 		// session_start handler runs first.
 		try {
-			sentPrompt ??= lastSentPrompt(ctx.sessionManager.getEntries() as never);
 			if (sentPrompt === undefined) return undefined; // no baseline: not a drift we can claim
 			return sentPrompt === promptFingerprint(ctx.getSystemPrompt()) ? undefined : "drift";
 		} catch {
@@ -703,8 +741,28 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	 * `ctx.compact()` is safe at these two points because nothing is in flight: it aborts nothing, and
 	 * its `session_before_compact` path summarises with the same list as the boundary drafts.
 	 */
+	/**
+	 * Read the session's own record once: the prompt the model was last sent, and the
+	 * selected model it was sent under. A mismatch there is a user switch that no request
+	 * has followed yet — `opus -> router/*`, `router/* -> opus`, or any other pair.
+	 */
+	let seeded = false;
+	const seedFromRecord = (ctx: ExtensionContext): void => {
+		if (seeded) return;
+		seeded = true;
+		try {
+			const record = lastSentPromptRecord(ctx.sessionManager.getEntries() as never);
+			sentPrompt = record.fingerprint;
+			const currentKey = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+			if (switchedSinceLastRequest(record, currentKey) && currentKey !== undefined) pendingSwitch = { to: currentKey };
+		} catch {
+			// No record: nothing to compare against.
+		}
+	};
+
 	const compactUpFront = async (why: string, ctx: ExtensionContext): Promise<void> => {
 		if (!config.enabled || inFlight) return;
+		seedFromRecord(ctx);
 		const r = resolve(ctx);
 		const cache = cacheState(ctx, r.next?.model);
 		const bust = bustReason(ctx, cache);
@@ -757,6 +815,23 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", (event, ctx) => atBoundary("settle", event as never, ctx) as never);
 	// Hard boundary: between the turns of a tool loop.
 	pi.on("turn_end", (event, ctx) => atBoundary("turn", event as never, ctx) as never);
+	// A model the user picked: this model has never seen the prefix, so the next request
+	// writes all of it. Fires for any selected model — concrete or `router/*` — and never
+	// for the router's own per-request choices, which do not change the selection.
+	pi.on("model_select", (event) => {
+		if (!isUserModelSwitch((event as { source?: unknown }).source)) return;
+		const model = (event as { model?: { provider?: string; id?: string } }).model;
+		pendingSwitch = { to: model?.provider && model.id ? `${model.provider}/${model.id}` : "unknown" };
+		// Nothing is billed for a switch by itself; the next message pays. Decide there.
+	});
+
+	// The next run is about to build its request: if the user switched since the last one,
+	// compact first. Idle switches that are never followed by a message cost nothing.
+	pi.on("before_agent_start", async (_event, ctx) => {
+		if (pendingSwitch === undefined || inFlight) return;
+		await compactUpFront("switch", ctx);
+	});
+
 	// The model is about to be sent this prompt: remember it, so a later session start
 	// can tell a re-read AGENTS.md from the prompt the cache was built on. Cached in
 	// memory: the branch scan happens once per session, not once per request.

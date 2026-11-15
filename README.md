@@ -37,6 +37,12 @@ compacts first — one summary plus a ~50k write instead of a 200k+ one. Two thi
   start, so an edited `AGENTS.md` (or a pi upgrade changing the docs path) replaces the head of the
   prompt and invalidates every token after it. Measured: a 3.5k-char `AGENTS.md` edit on a 240k
   session cost $1.61 as a full rewrite; compacting at the same moment costs ~$0.43.
+- **`switch`** — the user picked a different model. Model caches are per provider and per model, so a
+  model that has not served this session holds nothing for this prefix: the next request is a full
+  write. Any switch of the *selected* model counts, including to and from a `router/*` virtual model.
+  The router's own per-request choice does not: it never changes the selection, so it emits no
+  `model_select` and the extension never sees it. A switch is decided when the next run starts, so
+  switching back without sending a message costs nothing.
 
 The two share one line because they share one property: the write is already unavoidable and grows
 with the context, not with the window. `bustTokens` is therefore independent of `softTokens` — it

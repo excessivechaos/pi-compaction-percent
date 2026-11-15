@@ -70,6 +70,26 @@ eq(m.lastSentPrompt([{ type: "message", message: { role: "system" } }]), undefin
 eq(m.lastSentPrompt(entries(["1:aaaa", "2:bbbb"])), "2:bbbb", "the newest record wins");
 eq(m.lastSentPrompt([...entries(["1:aaaa"]), { type: "custom", customType: "other", data: { fingerprint: "3:cccc" } }]), "1:aaaa", "another extension's entries are ignored");
 
+// ---- user switches vs the router's own choices -------------------------------------------------
+// A record carries the *selected* model, so a router/* selection is compared as itself.
+const rec = (fingerprint, model) => [{ type: "custom", customType: m.PROMPT_ENTRY, data: { fingerprint, model } }];
+eq(m.lastSentPromptRecord(rec("1:a", "anthropic/claude-opus-4")), { fingerprint: "1:a", model: "anthropic/claude-opus-4" }, "the record keeps the model");
+eq(m.lastSentPromptRecord([]), {}, "no record, nothing to compare");
+eq(m.lastSentPromptRecord([{ type: "custom", customType: m.PROMPT_ENTRY, data: {} }]), {}, "a partial record is still a record");
+eq(m.isUserModelSwitch("set"), true, "an explicit choice is a user switch");
+eq(m.isUserModelSwitch("cycle"), true, "a cycle is a user switch");
+eq(m.isUserModelSwitch("init"), false, "startup is not a switch");
+eq(m.isUserModelSwitch(undefined), false, "a missing source is not a switch");
+const R = { fingerprint: "1:a", model: "anthropic/claude-opus-4" };
+eq(m.switchedSinceLastRequest(R, "router/auto"), true, "opus -> router/* is a switch");
+eq(m.switchedSinceLastRequest({ ...R, model: "router/auto" }, "anthropic/claude-opus-4"), true, "router/* -> opus is a switch");
+eq(m.switchedSinceLastRequest({ ...R, model: "router/auto" }, "router/auto"), false, "router/* -> router/* is not a switch");
+eq(m.switchedSinceLastRequest(R, "anthropic/claude-opus-4"), false, "the same model is not a switch");
+eq(m.switchedSinceLastRequest({ fingerprint: "1:a" }, "anthropic/claude-opus-4"), false, "no recorded model is not a switch");
+eq(m.switchedSinceLastRequest(R, undefined), false, "no current model is not a switch");
+eq(m.decide({ ...base, boundary: "settle", window: 1_000_000, bust: "switch", tokens: 150_000 }), { compact: true, tier: "bust", tokens: 150_000, line: 150_000, window: 1_000_000, bust: "switch" }, "a user switch is a bust like any other");
+eq(m.decide({ ...base, boundary: "settle", window: 1_000_000, bust: "switch", tokens: 149_999 }).compact, false, "a switch below the line does not compact");
+
 // ---- decide: turn -----------------------------------------------------------------------------
 eq(d({ boundary: "turn", tokens: 400_000, loopContinues: false }).reason, "deferred-to-settle", "no tool results defers to settle");
 eq(d({ boundary: "turn", tokens: 299_999, loopContinues: true }).compact, false, "tool loop below the hard line");
