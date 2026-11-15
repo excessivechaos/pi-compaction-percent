@@ -497,8 +497,11 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	 */
 	const bustReason = (ctx: ExtensionContext, cache: { cold: boolean }): BustReason | undefined => {
 		if (cache.cold) return "expired";
-		if (sentPrompt === undefined) return undefined; // no baseline: not a drift we can claim
+		// Lazy: the baseline is read on first use, so this does not depend on which
+		// session_start handler runs first.
 		try {
+			sentPrompt ??= lastSentPrompt(ctx.sessionManager.getEntries() as never);
+			if (sentPrompt === undefined) return undefined; // no baseline: not a drift we can claim
 			return sentPrompt === promptFingerprint(ctx.getSystemPrompt()) ? undefined : "drift";
 		} catch {
 			return undefined;
