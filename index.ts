@@ -720,7 +720,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			skipBelow,
 		});
 		log(
-			`upfront(${why}) tokens=${r.tokens} window=${r.window} switching=${r.switching} bust=${bust ?? "-"}${cache.ageMs === undefined ? "" : ` age=${Math.round(cache.ageMs / 60_000)}m`} -> ${decision.compact ? `${decision.tier}${decision.compact && decision.bust ? `:${decision.bust}` : ""} (line ${decision.line})` : decision.reason}`,
+			`upfront(${why}) bustLine=${config.bustTokens} tokens=${r.tokens} window=${r.window} switching=${r.switching} bust=${bust ?? "-"}${cache.ageMs === undefined ? "" : ` age=${Math.round(cache.ageMs / 60_000)}m`} -> ${decision.compact ? `${decision.tier}${decision.compact && decision.bust ? `:${decision.bust}` : ""} (line ${decision.line})` : decision.reason}`,
 		);
 		if (!decision.compact) return;
 		if (config.dryRun) {
