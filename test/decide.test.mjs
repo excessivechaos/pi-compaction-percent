@@ -3,7 +3,17 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const PI_DIR = process.env.PI_PI_DIR ?? "/home/qualidiv/.pi/agent/install/releases/1.5.0";
+import { readdirSync } from "node:fs";
+import { homedir } from "node:os";
+/** PI_PI_DIR wins; otherwise the newest installed release, so an update does not strand the tests. */
+function piDir() {
+	if (process.env.PI_PI_DIR) return process.env.PI_PI_DIR;
+	const base = join(homedir(), ".pi", "agent", "install", "releases");
+	const versions = readdirSync(base).filter((v) => /^\d+\.\d+\.\d+$/.test(v));
+	versions.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+	return join(base, versions.at(-1));
+}
+const PI_DIR = piDir();
 const { createJiti } = await import(`${PI_DIR}/node_modules/jiti/lib/jiti.mjs`);
 const j = createJiti(import.meta.url, { interopDefault: true, moduleCache: false, alias: {
   "@earendil-works/pi-coding-agent": `${PI_DIR}/node_modules/@earendil-works/pi-coding-agent/dist/index.js`,
@@ -33,15 +43,32 @@ eq(d({ boundary: "settle", tokens: 200_000, switching: true }), { compact: true,
 eq(d({ boundary: "settle", tokens: 199_999, switching: true }).compact, false, "just under the lowered line does not");
 eq(d({ boundary: "settle", tokens: 200_000, switching: false }).compact, false, "margin does NOT apply without a switch");
 
-// ---- decide: cold cache -----------------------------------------------------------------------
-// soft 250k, margin 50k -> the cold band starts at 200k
-const cold = { boundary: "settle", window: 1_000_000, cacheCold: true };
-eq(d({ ...cold, tokens: 199_999 }).compact, false, "cold just under the band does not compact");
-eq(d({ ...cold, tokens: 200_000 }), { compact: true, tier: "cold", tokens: 200_000, line: 200_000, window: 1_000_000 }, "cold at the band compacts before the write");
-eq(d({ ...cold, tokens: 250_000, cacheCold: false }).tier, "soft", "warm cache keeps the plain soft line");
-eq(d({ boundary: "turn", window: 1_000_000, cacheCold: true, loopContinues: true, tokens: 200_000 }).tier, "cold", "cold turn with a live loop compacts");
-eq(d({ boundary: "turn", window: 1_000_000, cacheCold: true, loopContinues: false, tokens: 200_000 }).reason, "deferred-to-settle", "cold turn without a loop defers to settle");
-eq(d({ ...cold, tokens: 200_000, config: C({ marginTokens: 100_000 }) }).line, 150_000, "a wider margin lowers the cold band");
+// ---- decide: a known bust (expired cache, changed system prompt) -------------------------------
+// 150k bust line, independent of the window and of the soft line
+const bust = { boundary: "settle", window: 1_000_000, bust: "expired" };
+eq(d({ ...bust, tokens: 149_999 }).compact, false, "bust just under the line does not compact");
+eq(d({ ...bust, tokens: 150_000 }), { compact: true, tier: "bust", tokens: 150_000, line: 150_000, window: 1_000_000, bust: "expired" }, "bust at the line compacts before the write");
+eq(d({ ...bust, tokens: 150_000, bust: undefined }), { compact: false, reason: "below" }, "a warm cache with a stable prompt keeps the plain soft line");
+eq(d({ boundary: "turn", window: 1_000_000, bust: "expired", loopContinues: true, tokens: 150_000 }).tier, "bust", "bust on a turn with a live loop compacts");
+eq(d({ boundary: "turn", window: 1_000_000, bust: "expired", loopContinues: false, tokens: 150_000 }).reason, "deferred-to-settle", "bust on a turn without a loop defers to settle");
+eq(d({ ...bust, tokens: 150_000, bust: "drift" }).bust, "drift", "a changed system prompt is its own reason");
+eq(d({ ...bust, tokens: 250_000 }).tier, "bust", "the bust line wins below soft");
+eq(d({ ...bust, tokens: 260_000, bust: undefined }).tier, "soft", "without a bust the soft line applies");
+eq(d({ boundary: "settle", window: 200_000, bust: "expired", tokens: 150_000 }).line, 150_000, "the bust line holds inside a small window");
+eq(d({ boundary: "settle", window: 100_000, bust: "expired", tokens: 60_000 }).compact, false, "100k window: nothing to do at 60k");
+eq(d({ boundary: "settle", window: 100_000, bust: "expired", tokens: 95_000 }).line, 90_000, "the bust line never exceeds the hard line");
+eq(d({ ...bust, tokens: 150_000, config: C({ bustTokens: 200_000 }) }).compact, false, "a higher bust line is honoured");
+eq(d({ ...bust, tokens: 200_000, config: C({ bustTokens: 200_000 }) }).line, 200_000, "a higher bust line is honoured at the line");
+
+// ---- prompt fingerprints: a change is visible, the same prompt is not ---------------------------
+eq(m.promptFingerprint("abc") === m.promptFingerprint("abc"), true, "same text, same fingerprint");
+eq(m.promptFingerprint("abc") === m.promptFingerprint("abd"), false, "one character changes it");
+eq(m.promptFingerprint("").startsWith("0:"), true, "empty text still fingerprints");
+const entries = (hashes) => hashes.map((h) => ({ type: "custom", customType: m.PROMPT_ENTRY, data: { fingerprint: h } }));
+eq(m.lastSentPrompt([]), undefined, "no record: unknown baseline, not drift");
+eq(m.lastSentPrompt([{ type: "message", message: { role: "system" } }]), undefined, "system messages are not the record");
+eq(m.lastSentPrompt(entries(["1:aaaa", "2:bbbb"])), "2:bbbb", "the newest record wins");
+eq(m.lastSentPrompt([...entries(["1:aaaa"]), { type: "custom", customType: "other", data: { fingerprint: "3:cccc" } }]), "1:aaaa", "another extension's entries are ignored");
 
 // ---- decide: turn -----------------------------------------------------------------------------
 eq(d({ boundary: "turn", tokens: 400_000, loopContinues: false }).reason, "deferred-to-settle", "no tool results defers to settle");

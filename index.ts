@@ -75,6 +75,12 @@ export interface CompactionPercentConfig {
 	hardWindowFraction: number;
 	/** Distance from the hard line down to the soft line; capped at a quarter of the hard line. */
 	softGapTokens: number;
+	/**
+	 * The line for a bust we already know about: the next request rewrites the whole
+	 * prefix (the cache expired, or the system prompt changed under it). Above this,
+	 * compact first: one summary plus a small write beats one giant one.
+	 */
+	bustTokens: number;
 	/** How far below the soft line still counts as "at the line" on a switch or a cold cache. */
 	marginTokens: number;
 	/**
@@ -92,6 +98,7 @@ export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	hardTokens: 300_000,
 	hardWindowFraction: 0.9,
 	softGapTokens: 50_000,
+	bustTokens: 150_000,
 	marginTokens: 50_000,
 	compactionModels: ["current"],
 	dryRun: false,
@@ -159,6 +166,7 @@ export function normalize(config: CompactionPercentConfig): CompactionPercentCon
 		softTokens: Math.max(1_000, soft),
 		hardWindowFraction: readFraction(config.hardWindowFraction, DEFAULT_CONFIG.hardWindowFraction),
 		softGapTokens: readTokens(config.softGapTokens, DEFAULT_CONFIG.softGapTokens),
+		bustTokens: readTokens(config.bustTokens, DEFAULT_CONFIG.bustTokens),
 		marginTokens: readTokens(config.marginTokens, DEFAULT_CONFIG.marginTokens),
 	};
 }
@@ -173,6 +181,7 @@ export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 			hardTokens: readTokens(raw.hardTokens, DEFAULT_CONFIG.hardTokens),
 			hardWindowFraction: readFraction(raw.hardWindowFraction, DEFAULT_CONFIG.hardWindowFraction),
 			softGapTokens: readTokens(raw.softGapTokens, DEFAULT_CONFIG.softGapTokens),
+			bustTokens: readTokens(raw.bustTokens, DEFAULT_CONFIG.bustTokens),
 			marginTokens: readTokens(raw.marginTokens, DEFAULT_CONFIG.marginTokens),
 			compactionModels: readModels(raw),
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
@@ -220,8 +229,19 @@ export function lines(config: CompactionPercentConfig, window: number, switching
 }
 
 export type Decision =
-	| { compact: true; tier: "soft" | "hard" | "cold"; tokens: number; line: number; window: number }
+	| {
+			compact: true;
+			tier: "soft" | "hard" | "bust";
+			tokens: number;
+			line: number;
+			window: number;
+			/** Set on a bust decision: why the next request will write the whole prefix. */
+			bust?: BustReason;
+	  }
 	| { compact: false; reason: string };
+
+/** Why the cached prefix is going to be rewritten no matter what. */
+export type BustReason = "expired" | "drift";
 
 /**
  * Pure rule.
@@ -242,24 +262,29 @@ export function decide(input: {
 	switching: boolean;
 	/** `turn` only: the turn issued tool calls, so another request follows. */
 	loopContinues?: boolean;
-	/** The cached prefix has expired: the next request is a full write either way. */
-	cacheCold?: boolean;
+	/**
+	 * The prefix is going to be rewritten whatever happens next: the cache expired
+	 * (`expired`), or the system prompt changed underneath it (`drift`).
+	 */
+	bust?: BustReason;
 	now: number;
 	backoffUntil?: number;
 	skipBelow?: number;
 }): Decision {
-	const { config, boundary, tokens, window, switching, loopContinues, cacheCold, now, backoffUntil, skipBelow } = input;
+	const { config, boundary, tokens, window, switching, loopContinues, bust, now, backoffUntil, skipBelow } = input;
 	if (!config.enabled) return { compact: false, reason: "disabled" };
 	if (tokens === undefined) return { compact: false, reason: "no-usage" };
 	if (window === undefined || window <= 0) return { compact: false, reason: "no-window" };
 	if (backoffUntil !== undefined && now < backoffUntil) return { compact: false, reason: "backoff" };
 	if (skipBelow !== undefined && tokens < skipBelow) return { compact: false, reason: "nothing-to-compact" };
 	const l = lines(config, window, switching);
-	// Cold cache: pay a summary now instead of writing the whole context on the next request. Only
-	// when a request is actually next — a settle, or a turn that still has a tool loop to run.
-	if (cacheCold === true && (boundary === "settle" || loopContinues === true)) {
-		const coldLine = Math.max(0, l.soft - config.marginTokens);
-		if (tokens >= coldLine) return { compact: true, tier: "cold", tokens, line: coldLine, window };
+	// A known bust: pay a summary now instead of writing the whole context on the next request.
+	// Only when a request is actually next — a settle, or a turn that still has a tool loop to run.
+	// The line is its own setting: a bust is expensive in proportion to the context, not to the
+	// window, so it sits below the soft line and does not move with it.
+	if (bust !== undefined && (boundary === "settle" || loopContinues === true)) {
+		const bustLine = Math.min(config.bustTokens, l.hard);
+		if (tokens >= bustLine) return { compact: true, tier: "bust", tokens, line: bustLine, window, bust };
 	}
 	if (boundary === "settle") {
 		return tokens >= l.soft ? { compact: true, tier: "soft", tokens, line: l.soft, window } : { compact: false, reason: "below" };
@@ -286,6 +311,33 @@ export function floorAfter(before: number, after: number, window: number): numbe
 interface Next {
 	model: string;
 	source: string;
+}
+
+/** Session entry type recording the system prompt the model has actually been sent. */
+export const PROMPT_ENTRY = "compaction-percent:prompt";
+
+/** A stable digest of the rendered system prompt; FNV-1a, enough to detect a change. */
+export function promptFingerprint(text: string): string {
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < text.length; i++) {
+		hash ^= text.charCodeAt(i);
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return `${text.length}:${hash.toString(16).padStart(8, "0")}`;
+}
+
+/**
+ * The fingerprint of the prompt the model was last sent, from this session's own record.
+ * `undefined` when this session predates the record: an unknown baseline is not a drift.
+ */
+export function lastSentPrompt(entries: readonly { type?: string; customType?: string; data?: unknown }[]): string | undefined {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry?.type !== "custom" || entry.customType !== PROMPT_ENTRY) continue;
+		const data = entry.data as { fingerprint?: unknown } | undefined;
+		if (typeof data?.fingerprint === "string") return data.fingerprint;
+	}
+	return undefined;
 }
 
 /** `provider/id` of the newest assistant response, and the index it sits at. */
@@ -395,6 +447,8 @@ const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(
 
 export default function compactionPercent(pi: ExtensionAPI): void {
 	let config = loadConfig();
+	/** Fingerprint of the system prompt the model was last sent, for the drift check. */
+	let sentPrompt: string | undefined;
 	let inFlight = false;
 	let backoffUntil: number | undefined;
 	let skipBelow: number | undefined;
@@ -435,6 +489,22 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	 * writes the whole prefix whatever we do. Measured from the last assistant message: only provider
 	 * requests refresh a cache entry, so a tool that ran for an hour does not count as activity.
 	 */
+	/**
+	 * Why the next request will rewrite the whole prefix, if we can tell. Expiry is
+	 * measured against the provider's TTL; `drift` is a system prompt that differs
+	 * from the one the model was last sent — context files are re-read at session
+	 * start, so an edited AGENTS.md changes the head under a warm cache.
+	 */
+	const bustReason = (ctx: ExtensionContext, cache: { cold: boolean }): BustReason | undefined => {
+		if (cache.cold) return "expired";
+		if (sentPrompt === undefined) return undefined; // no baseline: not a drift we can claim
+		try {
+			return sentPrompt === promptFingerprint(ctx.getSystemPrompt()) ? undefined : "drift";
+		} catch {
+			return undefined;
+		}
+	};
+
 	const cacheState = (ctx: ExtensionContext, nextKey: string | undefined): { cold: boolean; ageMs?: number; ttlMs: number } => {
 		const retention = process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
 		const parts = nextKey === undefined ? undefined : splitModelKey(nextKey);
@@ -582,7 +652,8 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			window: r.window,
 			switching: r.switching,
 			loopContinues: boundary === "turn" ? (event.toolResults?.length ?? 0) > 0 && event.outcome === "completed" : undefined,
-			cacheCold: cache.cold,
+			// Mid-run the prompt cannot change; only expiry can bust it here.
+			bust: cache.cold ? "expired" : undefined,
 			now: Date.now(),
 			backoffUntil,
 			skipBelow,
@@ -633,18 +704,21 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		if (!config.enabled || inFlight) return;
 		const r = resolve(ctx);
 		const cache = cacheState(ctx, r.next?.model);
+		const bust = bustReason(ctx, cache);
 		const decision = decide({
 			config,
 			boundary: "settle",
 			tokens: r.tokens,
 			window: r.window,
 			switching: r.switching,
-			cacheCold: cache.cold,
+			bust,
 			now: Date.now(),
 			backoffUntil,
 			skipBelow,
 		});
-		log(`upfront(${why}) tokens=${r.tokens} window=${r.window} switching=${r.switching} cold=${cache.cold}${cache.ageMs === undefined ? "" : ` age=${Math.round(cache.ageMs / 60_000)}m`} -> ${decision.compact ? `${decision.tier} (line ${decision.line})` : decision.reason}`);
+		log(
+			`upfront(${why}) tokens=${r.tokens} window=${r.window} switching=${r.switching} bust=${bust ?? "-"}${cache.ageMs === undefined ? "" : ` age=${Math.round(cache.ageMs / 60_000)}m`} -> ${decision.compact ? `${decision.tier}${decision.compact && decision.bust ? `:${decision.bust}` : ""} (line ${decision.line})` : decision.reason}`,
+		);
 		if (!decision.compact) return;
 		if (config.dryRun) {
 			ctx.ui.notify(
@@ -680,8 +754,28 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	pi.on("agent_before_settle", (event, ctx) => atBoundary("settle", event as never, ctx) as never);
 	// Hard boundary: between the turns of a tool loop.
 	pi.on("turn_end", (event, ctx) => atBoundary("turn", event as never, ctx) as never);
+	// The model is about to be sent this prompt: remember it, so a later session start
+	// can tell a re-read AGENTS.md from the prompt the cache was built on. Cached in
+	// memory: the branch scan happens once per session, not once per request.
+	pi.on("before_provider_request", (_event, ctx) => {
+		try {
+			const fingerprint = promptFingerprint(ctx.getSystemPrompt());
+			if (sentPrompt === fingerprint) return;
+			sentPrompt = fingerprint;
+			pi.appendEntry(PROMPT_ENTRY, { fingerprint, at: Date.now(), model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined });
+		} catch {
+			// A fingerprint is a cost optimization, never a reason to fail a request.
+		}
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		config = loadConfig();
+		// Baseline for the drift check: the prompt the model was last sent in this session.
+		try {
+			sentPrompt = lastSentPrompt(ctx.sessionManager.getEntries() as never);
+		} catch {
+			sentPrompt = undefined;
+		}
 		keepRecentCache = undefined;
 		warnedNoNext = warnedNoModel = warnedFailure = false;
 		skipBelow = backoffUntil = undefined;

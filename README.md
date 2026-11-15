@@ -26,13 +26,21 @@ at 250k, and only the ceiling moves. A model that cannot hold the hard line uses
 100k window    soft 68k    hard 90k           (gap shrinks to a quarter of the hard line)
 ```
 
-A third trigger is the cache expiring. After the entry's TTL (one hour under `PI_CACHE_RETENTION=long`)
-the provider charges a full write of the whole prefix, so the next request costs the same whether or not
-the context was compacted — except that compacting first writes ~55k instead of everything. When the last
-assistant message is older than the model's `promptCache` tier and the context is within `marginTokens`
-of the soft line, the extension compacts before that request. This is the case an unanswered
-question or a long blocking tool produces: the run is still open, nothing refreshed the cache, and the turn
-that resolves it would pay for the entire prefix.
+A third trigger is a **bust we can see coming**: the next request rewrites the whole prefix no matter
+what, so the only choice is what gets written. Above `bustTokens` (default 150k) the extension
+compacts first — one summary plus a ~50k write instead of a 200k+ one. Two things bust a prefix:
+
+- **`expired`** — the entry's TTL has passed (one hour under `PI_CACHE_RETENTION=long`). This is the
+  case an unanswered question or a long blocking tool produces: the run is still open, nothing
+  refreshed the cache, and the turn that resolves it would pay for the entire prefix.
+- **`drift`** — the system prompt changed under a warm cache. Context files are re-read at session
+  start, so an edited `AGENTS.md` (or a pi upgrade changing the docs path) replaces the head of the
+  prompt and invalidates every token after it. Measured: a 3.5k-char `AGENTS.md` edit on a 240k
+  session cost $1.61 as a full rewrite; compacting at the same moment costs ~$0.43.
+
+The two share one line because they share one property: the write is already unavoidable and grows
+with the context, not with the window. `bustTokens` is therefore independent of `softTokens` — it
+sits below it and does not move with it.
 
 The settle and turn boundaries otherwise fire *after* a request, so two other cases reach the next turn
 with no compaction at all: resuming a session that is already over the line, and a run the user aborted
@@ -42,8 +50,8 @@ write first (measured: $4.86 at 1-hour retention) and compacted twenty seconds l
 
 On a **switch** (the router is about to use a different model than the one that just answered) the
 soft line drops by `marginTokens` (50k): if the context is already that close to the incoming model's
-line, compacting now beats paying the cold start and compacting a few turns later. The same
-`marginTokens` sets the width of the cold band below the soft line.
+line, compacting now beats paying the cold start and compacting a few turns later. Every bust is decided before the request that would pay for it; `marginTokens` no longer governs
+that band.
 
 ```
 context 230k, router falls back to another model:   line = 250k - 50k = 200k   -> compact first
@@ -124,7 +132,8 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 | `hardTokens` | 300000 | hard line in tokens, mid tool loop |
 | `hardWindowFraction` | 0.9 | a model that cannot hold `hardTokens` uses this much of its window |
 | `softGapTokens` | 50000 | distance from the hard line down to the soft line (capped at ¼ of hard) |
-| `marginTokens` | 50000 | switch margin, and the width of the cold band below the soft line |
+| `marginTokens` | 50000 | how far a model switch lowers the soft line |
+| `bustTokens` | 150000 | compact before a known prefix rewrite (expired cache, changed system prompt) |
 | `compactionModels` | `["current"]` | summarisers tried in order; `"current"` = the model already serving; `[]` = pi native |
 | `dryRun` | false | decide and log, never write |
 

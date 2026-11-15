@@ -1,5 +1,21 @@
 # Changelog
 
+# Changelog
+
+## 2.4.0
+
+- **One "known bust" trigger.** `cacheCold` becomes `bust: "expired" | "drift"`, decided by a single
+  `bustTokens` line (default 150k) instead of a band under the soft line. A bust is expensive in
+  proportion to the context, not to the window, so the line is its own setting: above it, compact
+  before the next request and pay one summary plus a small write instead of a full-prefix rewrite.
+- **Drift detection.** The system prompt is fingerprinted on every request and recorded in a
+  `compaction-percent:prompt` entry (once per changed prompt, not per request). At `session_start`
+  the current fingerprint is compared with the recorded one: a re-read `AGENTS.md` — or a pi upgrade
+  changing the docs path — under a warm cache used to cost a whole-prefix write (measured $1.61 on a
+  240k session); it now compacts first at 150k+.
+- No baseline (a session written before this version) is never treated as drift: the first start
+  records one, the next compares against it.
+
 ## 2.3.0
 
 - **The lines are token counts, not percentages of the window.** `softTokens` (250k) and `hardTokens`
