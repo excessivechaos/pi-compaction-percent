@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.6.0
+
+- **A compaction says so.** The slow part of a boundary compaction is the summary itself, which runs
+  before the handler returns, and a resumed session compacts before its first request — in both the
+  UI sits idle for as long as the summariser takes, which reads as a hang. A footer line now states
+  what is happening and for how long: `⧗ compacting soft · 240k · 12s`, ticking once a second, with
+  the tier (`soft`/`hard`/`bust:expired`/`resume`/`switch`/`aborted-run`) and the context size. It
+  clears when the summary succeeds, fails, or times out, and is never painted for a dry run.
+
+
 ## 2.5.0
 
 - **A user model switch is a bust of its own.** `model_select` with source `set` or `cycle` marks the

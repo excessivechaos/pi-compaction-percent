@@ -477,8 +477,53 @@ const FAILURE_BACKOFF_MS = 60_000;
 const COMPACT_UPFRONT_TIMEOUT_MS = 180_000;
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
+/** The footer key the compaction indicator owns; nothing else writes it. */
+const INDICATOR_KEY = "compaction";
+/** `⧗ compacting threshold · 240k · 12s` — the one line that says why a quiet session is not hung. */
+export function indicatorText(label: string, tokens: number | undefined, elapsedMs: number): string {
+	const seconds = Math.max(0, Math.round(elapsedMs / 1000));
+	return `⧗ compacting ${label}${tokens === undefined ? "" : ` · ${fmt(tokens)}`} · ${seconds}s`;
+}
+
 export default function compactionPercent(pi: ExtensionAPI): void {
 	let config = loadConfig();
+	/**
+	 * A boundary compaction summarises before it returns, and a resumed session compacts
+	 * before its first request: both leave the UI looking idle for as long as the summary
+	 * takes, which reads as a hang. The footer is the one place that is visible in every
+	 * one of those states, so the indicator lives there and ticks once a second.
+	 */
+	let indicatorTimer: ReturnType<typeof setInterval> | undefined;
+	let indicatorLabel = "";
+	let indicatorSince = 0;
+	let indicatorTokens: number | undefined;
+	const paintIndicator = (ctx: ExtensionContext): void => {
+		try {
+			ctx.ui.setStatus(INDICATOR_KEY, indicatorText(indicatorLabel, indicatorTokens, Date.now() - indicatorSince));
+		} catch {
+			// A footer line is decoration: never let it break a compaction.
+		}
+	};
+	const startIndicator = (ctx: ExtensionContext, label: string, tokens: number | undefined): void => {
+		stopIndicator(ctx);
+		indicatorLabel = label;
+		indicatorTokens = tokens;
+		indicatorSince = Date.now();
+		paintIndicator(ctx);
+		indicatorTimer = setInterval(() => paintIndicator(ctx), 1000);
+		indicatorTimer.unref?.();
+	};
+	const stopIndicator = (ctx: ExtensionContext): void => {
+		if (indicatorTimer !== undefined) {
+			clearInterval(indicatorTimer);
+			indicatorTimer = undefined;
+		}
+		try {
+			ctx.ui.setStatus(INDICATOR_KEY, undefined);
+		} catch {
+			// Same: decoration.
+		}
+	};
 	/** Fingerprint of the system prompt the model was last sent, for the drift check. */
 	let sentPrompt: string | undefined;
 	/** A model the user picked that has not yet seen a request; consumed by the next decision. */
@@ -708,6 +753,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			return undefined;
 		}
 		inFlight = true;
+		startIndicator(ctx, decision.bust === undefined ? decision.tier : `${decision.tier}:${decision.bust}`, decision.tokens);
 		try {
 			const draft = await draftFor(ctx, decision, r.switching, r.next?.model);
 			if (!draft) {
@@ -729,6 +775,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			return undefined;
 		} finally {
 			inFlight = false;
+			stopIndicator(ctx);
 		}
 	};
 
@@ -790,6 +837,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		}
 		inFlight = true;
 		const started = Date.now();
+		startIndicator(ctx, why, decision.tokens);
 		try {
 			const finished = await new Promise<boolean>((done) => {
 				ctx.compact({ onComplete: () => done(true), onError: () => done(false) });
@@ -807,6 +855,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			);
 		} finally {
 			inFlight = false;
+			stopIndicator(ctx);
 		}
 	};
 

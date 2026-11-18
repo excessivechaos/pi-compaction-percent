@@ -7,6 +7,18 @@ pi's own trigger is a token reserve, so one number is a different fraction of ev
 fallback to a smaller model happens *after* the cold start. This extension owns the trigger and
 works at the boundaries instead.
 
+## Indicator
+
+While a compaction runs, the footer carries one line so an idle session does not read as a hang:
+
+```
+⧗ compacting soft · 240k · 12s
+```
+
+The label is the tier or the up-front reason (`soft`, `hard`, `bust:expired`, `resume`, `switch`,
+`aborted-run`), the middle number is the context being summarised, and the last is elapsed time,
+ticking once a second. It clears when the summary ends, and a `dryRun` never paints it.
+
 ## The two lines
 
 ```

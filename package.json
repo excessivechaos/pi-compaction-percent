@@ -1,31 +1,31 @@
 {
-	"name": "pi-compaction-percent",
-	"version": "2.5.0",
-	"description": "Compact at a percentage of the next model's window: soft/hard lines, pre-switch compaction, summaries by a cheap model",
-	"keywords": [
-		"pi-package",
-		"pi",
-		"compaction",
-		"context",
-		"settings"
-	],
-	"license": "MIT",
-	"type": "module",
-	"files": [
-		"index.ts",
-		"README.md",
-		"CHANGELOG.md",
-		"LICENSE"
-	],
-	"pi": {
-		"extensions": [
-			"./index.ts"
-		]
-	},
-	"peerDependencies": {
-		"@earendil-works/pi-coding-agent": "*"
-	},
-	"engines": {
-		"node": ">=22.19.0"
-	}
+  "name": "pi-compaction-percent",
+  "version": "2.6.0",
+  "description": "Compact at a percentage of the next model's window: soft/hard lines, pre-switch compaction, summaries by a cheap model",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "compaction",
+    "context",
+    "settings"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "index.ts",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
 }
