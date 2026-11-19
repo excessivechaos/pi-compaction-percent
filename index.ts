@@ -326,8 +326,60 @@ export function promptFingerprint(text: string): string {
 	return `${text.length}:${hash.toString(16).padStart(8, "0")}`;
 }
 
+/** Text of a payload prompt field: a plain string, or a list of blocks. */
+function promptBlocks(value: unknown): string | undefined {
+	if (typeof value === "string") return value;
+	if (!Array.isArray(value)) return undefined;
+	const parts: string[] = [];
+	for (const block of value) {
+		if (typeof block === "string") {
+			parts.push(block);
+			continue;
+		}
+		const text = (block as { text?: unknown } | undefined)?.text;
+		if (typeof text === "string") parts.push(text);
+	}
+	return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+/**
+ * The system prompt as the provider receives it, read from the request payload (`system` for
+ * messages-style APIs, `instructions` for responses-style ones) instead of from
+ * `ctx.getSystemPrompt()`. The two are meant to agree, but a reload or a prompt-loadout refresh
+ * re-renders the local one, and only the payload is what the provider's cache entry was built on.
+ */
+export function wireSystemPrompt(payload: unknown): string | undefined {
+	if (typeof payload === "string") return payload;
+	if (payload === null || typeof payload !== "object") return undefined;
+	const bag = payload as Record<string, unknown>;
+	for (const key of ["system", "instructions"]) {
+		const text = promptBlocks(bag[key]);
+		if (text !== undefined) return text;
+	}
+	const messages = bag.messages;
+	if (Array.isArray(messages)) {
+		const head = messages[0] as { role?: unknown; content?: unknown } | undefined;
+		if (head?.role === "system") return promptBlocks(head.content);
+	}
+	return undefined;
+}
+
+/** Index of the first character that differs, or -1. Enough to see what a drift actually was. */
+export function firstDifference(a: string, b: string): number {
+	const end = Math.min(a.length, b.length);
+	for (let i = 0; i < end; i++) if (a[i] !== b[i]) return i;
+	return a.length === b.length ? -1 : end;
+}
+
 export interface PromptRecord {
+	/** The local `ctx.getSystemPrompt()` view. Also what older records carry alone. */
 	fingerprint?: string;
+	/** The same string, kept separate so a record carries both views. */
+	local?: string;
+	/** The prompt taken from the request payload: what the provider's cache entry was built on. */
+	wire?: string;
+	/** How the two views related on that request: `none` means they were never compared. */
+	sees?: PromptView;
 	/** The *selected* model the prompt was sent under; the router's own choices are not recorded. */
 	model?: string;
 }
@@ -343,6 +395,9 @@ export function lastSentPromptRecord(entries: readonly { type?: string; customTy
 		const data = entry.data as PromptRecord | undefined;
 		const record: PromptRecord = {};
 		if (typeof data?.fingerprint === "string") record.fingerprint = data.fingerprint;
+		if (typeof data?.local === "string") record.local = data.local;
+		if (typeof data?.wire === "string") record.wire = data.wire;
+		if (data?.sees === "exact" || data?.sees === "contains" || data?.sees === "differs") record.sees = data.sees;
 		if (typeof data?.model === "string") record.model = data.model;
 		return record;
 	}
@@ -352,6 +407,51 @@ export function lastSentPromptRecord(entries: readonly { type?: string; customTy
 /** The fingerprint of the prompt the model was last sent. */
 export function lastSentPrompt(entries: readonly { type?: string; customType?: string; data?: unknown }[]): string | undefined {
 	return lastSentPromptRecord(entries).fingerprint;
+}
+
+/** How the local render and the payload's prompt related on one request. */
+export type PromptView =
+	/** Never compared (a record from before the wire fingerprint existed). */
+	| "none"
+	/** The payload's prompt is the local render, byte for byte. */
+	| "exact"
+	/** The payload carries the local render inside a wrapper (Claude Code's preamble, say). */
+	| "contains"
+	/** One has text the other does not: the local render is not a view of what was sent. */
+	| "differs";
+
+/** Classify one request's two views of the system prompt. */
+export function promptView(localText: string, wireText: string | undefined): PromptView {
+	if (wireText === undefined) return "none";
+	if (wireText === localText) return "exact";
+	return wireText.includes(localText) ? "contains" : "differs";
+}
+
+/** What a changed local prompt means. */
+export type DriftVerdict =
+	/** Same as the last request, or no baseline to judge against. */
+	| "none"
+	/** The local prompt changed; the record comes from a session where the two views agreed. */
+	| "drift"
+	/** The local prompt changed, but local and wire already disagreed last time, so the change may
+	 * not be in what the provider caches. Held back rather than spending a summary on it. */
+	| "unconfirmed";
+
+/**
+ * Judge a local prompt against the last request's record. Drift is only claimed from a record
+ * whose views lined up (`sees` of `exact` or `contains`): then a change in the local render is a
+ * change in the head the cache was built on. A record that already disagreed — a reload or a
+ * loadout change re-rendering the prompt, or one written before the wire view existed — cannot
+ * tell an edit from its own noise, so it logs instead of spending a summary.
+ */
+export function driftVerdict(baseline: PromptRecord, localNow: string | undefined): DriftVerdict {
+	const local = baseline.local ?? baseline.fingerprint;
+	if (local === undefined || localNow === undefined) return "none";
+	if (local === localNow) return "none";
+	// Only a record that saw the local render inside what went on the wire can turn a
+	// change here into a claim about the cached head.
+	const sees = baseline.sees ?? "none";
+	return sees === "exact" || sees === "contains" ? "drift" : "unconfirmed";
 }
 
 /** `model_select` sources that mean the user chose this model. The router never emits one. */
@@ -526,6 +626,10 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	};
 	/** Fingerprint of the system prompt the model was last sent, for the drift check. */
 	let sentPrompt: string | undefined;
+	/** The last request's prompt record, both views: the baseline `driftVerdict` judges against. */
+	let baseline: PromptRecord = {};
+	/** One log line per session explaining a local/wire disagreement. */
+	let warnedDriftSource = false;
 	/** A model the user picked that has not yet seen a request; consumed by the next decision. */
 	let pendingSwitch: { to: string } | undefined;
 	let inFlight = false;
@@ -584,8 +688,17 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		// Lazy: the baseline is read on first use, so this does not depend on which
 		// session_start handler runs first.
 		try {
-			if (sentPrompt === undefined) return undefined; // no baseline: not a drift we can claim
-			return sentPrompt === promptFingerprint(ctx.getSystemPrompt()) ? undefined : "drift";
+			// No baseline: not a drift we can claim. A record whose own views disagree is
+			// logged, not acted on — see `driftVerdict`.
+			const localNow = promptFingerprint(ctx.getSystemPrompt());
+			const verdict = driftVerdict(baseline, localNow);
+			if (verdict === "drift") return "drift";
+			if (verdict === "unconfirmed") {
+				log(
+					`drift-unconfirmed local=${localNow} baseline.local=${baseline.local ?? baseline.fingerprint} baseline.wire=${baseline.wire} sees=${baseline.sees ?? "none"} action=hold`,
+				);
+			}
+			return undefined;
 		} catch {
 			return undefined;
 		}
@@ -884,12 +997,32 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 	// The model is about to be sent this prompt: remember it, so a later session start
 	// can tell a re-read AGENTS.md from the prompt the cache was built on. Cached in
 	// memory: the branch scan happens once per session, not once per request.
-	pi.on("before_provider_request", (_event, ctx) => {
+	pi.on("before_provider_request", (event, ctx) => {
 		try {
-			const fingerprint = promptFingerprint(ctx.getSystemPrompt());
+			// The payload is the string the provider hashes, so it — not the locally
+			// re-rendered prompt — is what the next session's drift check is measured against.
+			const wireText = wireSystemPrompt((event as { payload?: unknown }).payload);
+			const localText = ctx.getSystemPrompt();
+			const fingerprint = wireText === undefined ? promptFingerprint(localText) : promptFingerprint(wireText);
+			const local = promptFingerprint(localText);
+			const sees = promptView(localText, wireText);
+			if (sees === "differs" && !warnedDriftSource) {
+				warnedDriftSource = true;
+				const at = firstDifference(localText, wireText);
+				const window = (text: string) => (at < 0 ? "" : JSON.stringify(text.slice(Math.max(0, at - 20), at + 20)));
+				log(`drift-source local=${local} wire=${fingerprint} first-diff=${at} local@=${window(localText)} wire@=${window(wireText)}`);
+			}
 			if (sentPrompt === fingerprint) return;
 			sentPrompt = fingerprint;
-			pi.appendEntry(PROMPT_ENTRY, { fingerprint, at: Date.now(), model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined });
+			baseline = { local, wire: wireText === undefined ? undefined : fingerprint, sees };
+			pi.appendEntry(PROMPT_ENTRY, {
+				fingerprint: local,
+				local,
+				wire: wireText === undefined ? undefined : fingerprint,
+				sees,
+				at: Date.now(),
+				model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined,
+			});
 		} catch {
 			// A fingerprint is a cost optimization, never a reason to fail a request.
 		}
@@ -899,10 +1032,13 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		config = loadConfig();
 		// Baseline for the drift check: the prompt the model was last sent in this session.
 		try {
-			sentPrompt = lastSentPrompt(ctx.sessionManager.getEntries() as never);
+			baseline = lastSentPromptRecord(ctx.sessionManager.getEntries() as never);
+			sentPrompt = baseline.wire ?? baseline.local ?? baseline.fingerprint;
 		} catch {
+			baseline = {};
 			sentPrompt = undefined;
 		}
+		warnedDriftSource = false;
 		keepRecentCache = undefined;
 		warnedNoNext = warnedNoModel = warnedFailure = false;
 		skipBelow = backoffUntil = undefined;

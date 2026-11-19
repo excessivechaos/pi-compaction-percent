@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.7.0
+
+- **Drift is measured against the prompt the provider was sent.** `before_provider_request` now
+  fingerprints the system prompt in the request payload (`system` for messages-style APIs,
+  `instructions` for responses-style ones) instead of `ctx.getSystemPrompt()`. Those are not always
+  the same string: pi re-renders the local prompt as the tool loadout changes, while the head the
+  cache was built on is the one already in the transcript. A resumed 163k session compacted on that
+  difference and then read 162,458 tokens from cache — the drift was local only.
+- **An unusable baseline holds instead of spending.** The record keeps both views (`local`, `wire`)
+  and how they related (`sees`: `exact`, `contains`, `differs`). Drift is claimed only from a record
+  that saw the local render inside the payload; anything else logs `drift-unconfirmed … action=hold`.
+  Records written before this version have no wire view and therefore hold too — they heal on the
+  first request.
+- **The mismatch is logged once per session**, with the first differing byte and 20 characters either
+  side (`drift-source local=… wire=… first-diff=… local@=… wire@=…`), so the next occurrence is an
+  explanation rather than a guess. Needs `PI_COMPACTION_PERCENT_LOG`.
+
+
 ## 2.6.0
 
 - **A compaction says so.** The slow part of a boundary compaction is the summary itself, which runs
@@ -24,8 +42,6 @@
   up at `session_start` by comparing the recorded selected model with the current one.
 - Consumed once per switch, whether or not it fires: below the line there is nothing to compact, and a
   flag left over would later look like a bust on a warm cache.
-
-# Changelog
 
 ## 2.4.0
 

@@ -49,6 +49,13 @@ compacts first — one summary plus a ~50k write instead of a 200k+ one. Two thi
   start, so an edited `AGENTS.md` (or a pi upgrade changing the docs path) replaces the head of the
   prompt and invalidates every token after it. Measured: a 3.5k-char `AGENTS.md` edit on a 240k
   session cost $1.61 as a full rewrite; compacting at the same moment costs ~$0.43.
+  Judged against the prompt **the provider was sent**, taken from the request payload, not against
+  `getSystemPrompt()`: pi re-renders the local prompt as the tool loadout changes while the cached
+  head stays the one in the transcript, so the two views can diverge by themselves. A record that
+  saw the local render inside the payload (`exact` or `contains`) can turn a local change into a
+  claim about the cache; a record whose views already disagreed (`differs`, or one from before the
+  wire view existed) logs `drift-unconfirmed` and holds, instead of spending a summary on an
+  artifact.
 - **`switch`** — the user picked a different model. Model caches are per provider and per model, so a
   model that has not served this session holds nothing for this prefix: the next request is a full
   write. Any switch of the *selected* model counts, including to and from a `router/*` virtual model.
