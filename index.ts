@@ -373,11 +373,18 @@ export function wireSystemPrompt(payload: unknown): string | undefined {
 		const text = promptBlocks(bag[key]);
 		if (text !== undefined) return text;
 	}
-	const messages = bag.messages;
-	if (Array.isArray(messages)) {
-		const head = messages[0] as { role?: unknown; content?: unknown } | undefined;
-		// `developer` is the same prompt under the role OpenAI reasoning models use.
-		if (head?.role === "system" || head?.role === "developer") return promptBlocks(head.content);
+	// `messages` for chat-style APIs, `input` for responses-style ones (`openai-codex`,
+	// `openai-responses`): both carry the prompt as a leading system item. `developer` is the
+	// same prompt under the role OpenAI reasoning models use, and a `developer` item may also
+	// be a tool-addition marker with no text — hence the scan, not a fixed index.
+	for (const list of [bag.messages, bag.input]) {
+		if (!Array.isArray(list)) continue;
+		for (const item of list) {
+			const role = (item as { role?: unknown } | undefined)?.role;
+			if (role !== "system" && role !== "developer") continue;
+			const text = promptBlocks((item as { content?: unknown }).content);
+			if (text !== undefined) return text;
+		}
 	}
 	return undefined;
 }

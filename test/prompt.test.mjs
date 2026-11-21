@@ -32,6 +32,22 @@ const is = (a, b, label) => { assert.equal(a, b, label); checks++; };
 	is(m.wireSystemPrompt({ messages: [{ role: "system", content: "HEAD" }, { role: "user", content: "hi" }] }), "HEAD", "system message head");
 	is(m.wireSystemPrompt({ messages: [{ role: "developer", content: "DEV" }] }), "DEV", "reasoning models use the developer role");
 	is(m.wireSystemPrompt({ messages: [{ role: "user", content: "hi" }] }), undefined, "no system message");
+	is(
+		m.wireSystemPrompt({
+			input: [
+				{ type: "additional_tools", role: "developer", tools: [] },
+				{ type: "message", role: "developer", content: [{ type: "text", text: "CODEX" }] },
+				{ type: "message", role: "user", content: [{ type: "text", text: "hi" }] },
+			],
+		}),
+		"CODEX",
+		"responses-style input, past a developer tool marker",
+	);
+	is(
+		m.wireSystemPrompt({ input: [{ type: "message", role: "system", content: [{ type: "text", text: "IN" }] }] }),
+		"IN",
+		"responses-style input with a system item",
+	);
 	is(m.wireSystemPrompt({ system: [] }), undefined, "empty block list");
 	is(m.wireSystemPrompt(undefined), undefined, "no payload");
 	is(m.wireSystemPrompt("RAW"), "RAW", "a payload that is already the text");

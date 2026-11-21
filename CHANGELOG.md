@@ -1,5 +1,15 @@
 # Changelog
 
+## 2.8.1
+
+- **The wire prompt is read from `input` too.** Responses-style payloads (`openai-codex`,
+  `openai-responses`) carry the system prompt as a leading item in `input`, not in `system`,
+  `instructions` or `messages` — so on 1.6.0 a codex session recorded `sees: "none"` and drift
+  detection silently fell back to the local render. The scan now covers `input`, skips the
+  `developer` tool-addition markers that carry no text, and does not assume the prompt is the
+  first item.
+
+
 ## 2.8.0
 
 - **`compactionThinking`, and a measured default for the summariser.** The thinking level was hard
