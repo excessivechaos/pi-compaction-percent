@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.7.1
+
+- **The wire prompt can arrive as the `developer` role.** OpenAI reasoning models put the system
+  prompt in `messages[0]` with role `developer`, so `wireSystemPrompt` now accepts that spelling
+  too. Without it those providers fall back to the local prompt, which is the pre-2.7.0 behaviour.
+
+
 ## 2.7.0
 
 - **Drift is measured against the prompt the provider was sent.** `before_provider_request` now

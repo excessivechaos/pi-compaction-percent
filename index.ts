@@ -359,7 +359,8 @@ export function wireSystemPrompt(payload: unknown): string | undefined {
 	const messages = bag.messages;
 	if (Array.isArray(messages)) {
 		const head = messages[0] as { role?: unknown; content?: unknown } | undefined;
-		if (head?.role === "system") return promptBlocks(head.content);
+		// `developer` is the same prompt under the role OpenAI reasoning models use.
+		if (head?.role === "system" || head?.role === "developer") return promptBlocks(head.content);
 	}
 	return undefined;
 }

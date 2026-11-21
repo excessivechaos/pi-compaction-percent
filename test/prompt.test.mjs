@@ -30,6 +30,7 @@ const is = (a, b, label) => { assert.equal(a, b, label); checks++; };
 	is(m.wireSystemPrompt({ instructions: "RESPONSES" }), "RESPONSES", "responses-style instructions");
 	is(m.wireSystemPrompt({ instructions: "" }), "", "empty instructions are a prompt, not a miss");
 	is(m.wireSystemPrompt({ messages: [{ role: "system", content: "HEAD" }, { role: "user", content: "hi" }] }), "HEAD", "system message head");
+	is(m.wireSystemPrompt({ messages: [{ role: "developer", content: "DEV" }] }), "DEV", "reasoning models use the developer role");
 	is(m.wireSystemPrompt({ messages: [{ role: "user", content: "hi" }] }), undefined, "no system message");
 	is(m.wireSystemPrompt({ system: [] }), undefined, "empty block list");
 	is(m.wireSystemPrompt(undefined), undefined, "no payload");
