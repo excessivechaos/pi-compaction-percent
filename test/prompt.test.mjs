@@ -74,4 +74,12 @@ const is = (a, b, label) => { assert.equal(a, b, label); checks++; };
 	is(m.firstDifference("abc", "abc"), -1, "identical");
 	is(m.firstDifference("abc", "abcd"), 3, "one is a prefix");
 
+// ---- the summariser's thinking level ------------------------------------------------------
+	is(m.readThinking("max"), "max", "a known level passes through");
+	is(m.readThinking(" off "), "off", "whitespace is trimmed");
+	is(m.readThinking("nonsense"), "off", "an unknown level falls back to off");
+	is(m.readThinking(undefined), "off", "an absent level is off");
+	is(m.DEFAULT_CONFIG.compactionThinking, "off", "the default stays off");
+	ok(m.THINKING_LEVELS.includes("xhigh") && m.THINKING_LEVELS.includes("max"), "every pi level is offered");
+
 console.log(`ok ${checks} checks`);

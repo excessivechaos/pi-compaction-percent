@@ -1,6 +1,6 @@
 {
   "name": "pi-compaction-percent",
-  "version": "2.7.1",
+  "version": "2.8.0",
   "description": "Compact at a percentage of the next model's window: soft/hard lines, pre-switch compaction, summaries by a cheap model",
   "keywords": [
     "pi-package",

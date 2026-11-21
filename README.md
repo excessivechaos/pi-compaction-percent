@@ -99,7 +99,7 @@ newest messages and carrying a previous summary forward.
 
 The exception is the upfront path: `session_start` and an aborted run's `agent_settled` have no run
 to abort, so those two use `ctx.compact()` directly and summarise through the same
-`session_before_compact` handler. The first message waits for the result (bounded at 180 s), so the
+`session_before_compact` handler. The first message waits for the result (bounded at 300 s), so the
 request it triggers is already on the compacted context.
 
 Summaries are written by `compactionModels`, an ordered list tried until one answers — a quota-blocked
@@ -108,6 +108,13 @@ using, and an empty list means pi native. `/compact` and overflow recovery use t
 `session_before_compact`; if every entry fails there, pi summarises as it always did. On the boundary
 path a failed compaction writes nothing and backs off 60 s — pi's overflow recovery still guards the
 window.
+
+`compactionThinking` sets the summariser's own thinking level. Measured on a 94.5k prefix with
+`deepseek-v4.1-flash`: `off` wrote a 19.9k-char summary in 42 s for $0.0122; `max` spent 1,506
+reasoning tokens, wrote 25.7k chars in 65 s for $0.0141, and carried noticeably more of the concrete
+numbers (exact costs, versions, window sizes) that the summary exists to preserve. The level must be
+one the summariser model supports — `deepseek-v4.1-flash` offers `off`, `low`, `high`, `max`.
+`scripts/summariser-thinking.mjs` replays a real session through both levels to re-measure.
 
 ## Install
 
@@ -160,6 +167,7 @@ serialized conversation, so a 256k model cannot summarise a 500k compaction.
 | `marginTokens` | 50000 | how far a model switch lowers the soft line |
 | `bustTokens` | 150000 | compact before a known prefix rewrite (expired cache, changed system prompt) |
 | `compactionModels` | `["current"]` | summarisers tried in order; `"current"` = the model already serving; `[]` = pi native |
+| `compactionThinking` | `"off"` | thinking level for the summariser: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` |
 | `dryRun` | false | decide and log, never write |
 
 ## Commands

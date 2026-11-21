@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.0
+
+- **`compactionThinking`, and a measured default for the summariser.** The thinking level was hard
+  coded to `off`. It is now a setting, and this workstation runs `max`. Measured on a real 94.5k
+  prefix (232 messages) with `deepseek-v4.1-flash`, same prompt, both arms: `off` wrote 19,881 chars
+  in 41.6 s for $0.0122; `max` spent 1,506 reasoning tokens, wrote 25,650 chars in 65.4 s for
+  $0.0141 — +24 s, +$0.002, +29% summary, and 148 distinct numeric details against 113 (exact costs,
+  version numbers, window sizes). Deepseek's `max` is terse; the earlier assumption of ~10k reasoning
+  tokens was wrong by 6×, which is what made this affordable on the blocking path.
+- **The upfront ceiling moves from 180 s to 300 s** so a `max` summary of a larger prefix cannot be
+  abandoned mid-flight — that would pay the summary *and* the cold write it was meant to avoid.
+- `/compact-pct thinking <level>` sets the level; status shows it next to the summariser list.
+- `scripts/summariser-thinking.mjs` replays a session through several levels and reports time,
+  reasoning tokens, cost and the summaries themselves.
+
+
 ## 2.7.1
 
 - **The wire prompt can arrive as the `developer` role.** OpenAI reasoning models put the system

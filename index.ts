@@ -88,6 +88,13 @@ export interface CompactionPercentConfig {
 	 * `"current"` for the model this session is already using. Empty: pi summarises itself.
 	 */
 	compactionModels: string[];
+	/**
+	 * Thinking level for the summariser itself (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+	 * `max`). Measured on a 94.5k prefix with deepseek-v4.1-flash: `max` spent 1,506 reasoning
+	 * tokens, took 65s instead of 42s, cost $0.002 more, and kept a fifth more of the concrete
+	 * numbers. The value must be an effort the summariser model supports.
+	 */
+	compactionThinking: string;
 	/** Decide and log, never compact. */
 	dryRun: boolean;
 }
@@ -101,6 +108,7 @@ export const DEFAULT_CONFIG: CompactionPercentConfig = {
 	bustTokens: 150_000,
 	marginTokens: 50_000,
 	compactionModels: ["current"],
+	compactionThinking: "off",
 	dryRun: false,
 };
 
@@ -156,6 +164,14 @@ export function summariserKeys(models: readonly string[], currentKey: string | u
 	return out;
 }
 
+/** The thinking levels pi understands; anything else falls back to `off`. */
+export const THINKING_LEVELS: readonly string[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** A thinking level, or `off` when the value is not one pi knows. */
+export function readThinking(value: unknown): string {
+	return typeof value === "string" && THINKING_LEVELS.includes(value.trim()) ? value.trim() : DEFAULT_CONFIG.compactionThinking;
+}
+
 /** Keep the hard line at or above the soft line, whatever the file says. */
 export function normalize(config: CompactionPercentConfig): CompactionPercentConfig {
 	const hard = Math.max(1_000, readTokens(config.hardTokens, DEFAULT_CONFIG.hardTokens));
@@ -184,6 +200,7 @@ export function loadConfig(path = CONFIG_PATH): CompactionPercentConfig {
 			bustTokens: readTokens(raw.bustTokens, DEFAULT_CONFIG.bustTokens),
 			marginTokens: readTokens(raw.marginTokens, DEFAULT_CONFIG.marginTokens),
 			compactionModels: readModels(raw),
+			compactionThinking: readThinking(raw.compactionThinking),
 			dryRun: typeof raw.dryRun === "boolean" ? raw.dryRun : DEFAULT_CONFIG.dryRun,
 		});
 	} catch {
@@ -575,7 +592,11 @@ const log = (message: string) => {
 
 const FAILURE_BACKOFF_MS = 60_000;
 /** An upfront compaction holds the first message; give up rather than hang if a summariser stalls. */
-const COMPACT_UPFRONT_TIMEOUT_MS = 180_000;
+/**
+ * How long an upfront compaction may hold the first message. 300s covers a `max` thinking summary
+ * of a 100k prefix (~65s measured) with room for a slower one, and still ends well before a hang.
+ */
+const COMPACT_UPFRONT_TIMEOUT_MS = 300_000;
 const fmt = (n: number) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n));
 
 /** The footer key the compaction indicator owns; nothing else writes it. */
@@ -770,7 +791,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 					ctx.signal,
 					undefined,
 					previousSummary,
-					"off",
+					config.compactionThinking,
 					ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
 				);
 				if (!result.text.trim()) throw new Error("empty summary");
@@ -1071,7 +1092,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 					undefined,
 					event.customInstructions,
 					event.signal,
-					"off",
+					config.compactionThinking,
 					ctx.modelRegistry.streamSimple.bind(ctx.modelRegistry) as never,
 				);
 				if (failures.length > 0) log(`  pi-initiated summary by ${key} after: ${failures.join("; ")}`);
@@ -1096,7 +1117,7 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 			`compaction-percent ${config.enabled ? "on" : "off"} · soft ${fmt(config.softTokens)} · hard ${fmt(config.hardTokens)} (≤${Math.round(config.hardWindowFraction * 100)}% of window) · margin ${fmt(config.marginTokens)}${config.dryRun ? " · dry-run" : ""}`,
 			`next model ${r.next ? `${r.next.model} (${r.next.source})` : ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "—"}${r.switching ? " · SWITCHING" : ""} · window ${r.window === undefined ? "—" : r.window.toLocaleString()}`,
 			`context ${r.tokens === undefined ? "—" : r.tokens.toLocaleString()}${l ? ` · soft line ${l.soft.toLocaleString()} · hard line ${l.hard.toLocaleString()}` : ""}`,
-			`summaries by ${config.compactionModels.join(" -> ") || "(pi native)"} · ${CONFIG_PATH}`,
+			`summaries by ${config.compactionModels.join(" -> ") || "(pi native)"} · thinking ${config.compactionThinking} · ${CONFIG_PATH}`,
 		].join("\n");
 	};
 
@@ -1111,6 +1132,10 @@ export default function compactionPercent(pi: ExtensionAPI): void {
 		if (verb === "" || verb === "status") return ctx.ui.notify(statusText(ctx), "info");
 		if (verb === "on" || verb === "off") return save({ ...config, enabled: verb === "on" }, `compaction-percent ${verb}`);
 		if (verb === "dry-run") return save({ ...config, dryRun: !config.dryRun }, `dry-run ${!config.dryRun ? "on" : "off"}`);
+		if (verb === "thinking") {
+			if (!THINKING_LEVELS.includes(value)) return ctx.ui.notify(`compaction-percent: thinking must be one of ${THINKING_LEVELS.join(", ")}`, "warning");
+			return save({ ...config, compactionThinking: value }, `compaction-percent thinking ${value}`);
+		}
 		if (verb === "model" || verb === "models") {
 			if (!value) return ctx.ui.notify(statusText(ctx), "info");
 			if (value.trim() === "none" || value.trim() === "pi") return save({ ...config, compactionModels: [] }, "summaries: pi native only");
